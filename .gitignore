@@ -13,3 +13,8 @@ __pycache__/
 
 # 靶机数据文件（可能含靶标 URL，不要提交）
 data.json
+
+# 凭据：绝对不能入库
+.env
+.env.*
+!.env.example

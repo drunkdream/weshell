@@ -1,0 +1,15 @@
+# 构建产物（前端已 go:embed 进二进制，无需入库）
+/weshell
+/weshell-*
+/bin/
+/dist/
+
+# 运行期数据、日志与测试残留
+*.log
+*.json.tmp
+.smoke/
+__pycache__/
+*.pyc
+
+# 靶机数据文件（可能含靶标 URL，不要提交）
+data.json

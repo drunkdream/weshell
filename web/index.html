@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>weshell 管理端</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">ws</span>
+    <div>
+      <h1>weshell</h1>
+      <p class="sub">CTF 靶场 / 教学用 Webshell 管理端</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <button id="btnNew" class="btn primary">新建靶标</button>
+  </div>
+</header>
+
+<div class="notice">
+  <strong>使用前提</strong>：仅可连接你自有或持有明确授权的 CTF / 教学靶机。本工具全程明文通信、不带任何绕过与免杀能力，所有执行的命令都会写入服务端审计日志。
+</div>
+
+<main class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <span>靶标列表</span>
+      <span id="targetCount" class="badge">0</span>
+    </div>
+    <ul id="targetList" class="target-list"></ul>
+    <div class="sidebar-foot">
+      <div id="labUrl" class="lab-url" hidden></div>
+      <button id="btnHistory" class="btn ghost block">查看执行记录</button>
+    </div>
+  </aside>
+
+  <section class="content">
+    <div id="empty" class="empty">
+      <p>左侧选择一个靶标，或点击「新建靶标」开始。</p>
+    </div>
+
+    <div id="workspace" class="workspace hidden">
+      <div class="target-head">
+        <div>
+          <h2 id="tName">—</h2>
+          <p id="tMeta" class="meta"></p>
+        </div>
+        <div class="actions">
+          <button id="btnEdit" class="btn ghost">编辑</button>
+          <button id="btnDelete" class="btn danger">删除</button>
+        </div>
+      </div>
+
+      <div class="quick">
+        <span class="label">快捷命令</span>
+        <button class="chip" data-cmd="whoami">whoami</button>
+        <button class="chip" data-cmd="id">id</button>
+        <button class="chip" data-cmd="uname -a">uname -a</button>
+        <button class="chip" data-cmd="pwd">pwd</button>
+        <button class="chip" data-cmd="ls -la">ls -la</button>
+        <button class="chip" data-cmd="ip addr">ip addr</button>
+        <button class="chip" data-cmd="cat /etc/passwd">cat /etc/passwd</button>
+      </div>
+
+      <div class="console">
+        <div class="prompt">
+          <span class="dollar">$</span>
+          <input id="cmdInput" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="输入命令，回车执行；↑ / ↓ 翻阅历史">
+          <button id="btnRun" class="btn primary">执行</button>
+        </div>
+        <div class="hints">Ctrl + Enter 换行无效 · 回车即执行 · 命令通过 ↑↓ 复用</div>
+      </div>
+
+      <div id="output" class="output" aria-live="polite"></div>
+    </div>
+  </section>
+</main>
+
+<!-- 靶标表单 -->
+<div id="modalTarget" class="modal hidden">
+  <div class="modal-card">
+    <h3 id="formTitle">新建靶标</h3>
+    <form id="targetForm">
+      <label>名称
+        <input name="name" required placeholder="靶机 A - upload 题">
+      </label>
+      <label>URL
+        <input name="url" required placeholder="http://10.0.0.5/uploads/shell.php">
+      </label>
+      <label>连接类型
+        <select name="shellType" id="shellType"></select>
+      </label>
+      <p id="typeNote" class="note"></p>
+      <div class="row">
+        <label>参数名
+          <input name="param" required placeholder="pass">
+        </label>
+        <label>请求方法
+          <select name="method">
+            <option value="POST">POST</option>
+            <option value="GET">GET</option>
+          </select>
+        </label>
+      </div>
+      <label>备注
+        <input name="note" placeholder="题目来源、解题思路等">
+      </label>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" data-close>取消</button>
+        <button type="submit" class="btn primary">保存</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- 执行记录 -->
+<div id="modalHistory" class="modal hidden">
+  <div class="modal-card wide">
+    <h3>执行记录</h3>
+    <div id="historyBody" class="history-body"></div>
+    <div class="modal-actions">
+      <button type="button" class="btn ghost" data-close>关闭</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

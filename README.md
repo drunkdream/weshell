@@ -8,14 +8,15 @@ CTF 靶场 / 教学场景下的 Webshell 管理端。单二进制，前端用 `e
 
 ## 边界
 
-本项目**只实现**靶标管理与「HTTP 与马通信 + shell 命令执行与回显」。
+本项目**只实现**靶标管理与「HTTP 与马通信 + shell 命令执行与回显 + 靶机文件管理」；文件管理依赖 php-eval 型靶机。
 
 刻意不做、也不会做：
 
 - 流量加密、编码混淆、WAF 绕过、免杀
-- 上传下载、文件管理
 - 提权、持久化、内网横向
 - 多马型适配（插件式套壳）
+
+> 文件管理（列目录 / 读 / 写 / 删 / 上传 / 下载）已实现，但仅对 php-eval 型靶机生效，依赖管理端向靶机提交一小段 PHP 代码完成，仍是明文通信。
 
 通信为明文表单/查询串，便于直接抓包对照讲解。
 
@@ -48,6 +49,10 @@ go build -o weshell .
 | PUT | `/api/targets/{id}` | 更新靶标 |
 | DELETE | `/api/targets/{id}` | 删除靶标 |
 | POST | `/api/targets/{id}/exec` | 执行命令，body `{"command":"whoami"}` |
+| GET | `/api/targets/{id}/fs/list?path=` | 列出靶机目录（php-eval 型） |
+| GET | `/api/targets/{id}/fs/read?path=` | 读取文件，base64 回传（下载同此接口） |
+| POST | `/api/targets/{id}/fs/write` | 写入/覆盖文件，body `{"path","base64"}`（上传同此接口） |
+| POST | `/api/targets/{id}/fs/delete` | 删除文件/目录，body `{"path"}` |
 
 ## 靶标字段
 

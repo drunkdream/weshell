@@ -23,6 +23,9 @@ import (
 // maxRequestBytes 限制接口请求体大小。
 const maxRequestBytes = 1 << 20 // 1 MiB
 
+// probeMark 是新增靶标时用于探测 shell 是否工作的回显标记。
+const probeMark = "__weshell_probe__"
+
 // Config 是接口层的运行参数。
 type Config struct {
 	// Timeout 为单次命令执行的超时时间。
@@ -127,6 +130,29 @@ func (s *Server) handleTargets(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, newError(err.Error()))
 			return
 		}
+
+		// 新增前先探测靶机是否可达且 shell 工作正常，避免存入无法连接的靶标。
+		probe := shell.Execute(r.Context(), shell.ExecOptions{
+			TargetURL: t.URL,
+			Param:     t.Param,
+			Method:    t.Method,
+			Type:      t.ShellType,
+			Command:   "echo " + probeMark,
+			Timeout:   s.cfg.Timeout,
+		})
+		if !probe.OK {
+			msg := probe.Error
+			if msg == "" {
+				msg = "靶机返回非成功状态"
+			}
+			writeJSON(w, http.StatusBadRequest, newError("靶机不可达或 shell 未工作正常: "+msg))
+			return
+		}
+		if !strings.Contains(probe.Output, probeMark) {
+			writeJSON(w, http.StatusBadRequest, newError("shell 回显未包含预期标记，可能连接参数或类型不匹配"))
+			return
+		}
+
 		created, err := s.store.Add(t)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, newError(err.Error()))
@@ -149,6 +175,28 @@ func (s *Server) handleTargetItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 文件管理：/api/targets/{id}/fs/{op}
+	if len(parts) >= 2 && parts[1] == "fs" {
+		s.handleFS(w, r, id, parts[2:])
+		return
+	}
+
+	// 系统监控：/api/targets/{id}/sys/info
+	if len(parts) >= 2 && parts[1] == "sys" {
+		s.handleSys(w, r, id)
+		return
+	}
+
+	// 进程管理：/api/targets/{id}/proc/{list|kill}
+	if len(parts) >= 2 && parts[1] == "proc" {
+		if len(parts) >= 3 && parts[2] == "kill" {
+			s.handleProcKill(w, r, id)
+			return
+		}
+		s.handleProc(w, r, id)
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
 		if len(parts) != 1 {
@@ -167,6 +215,11 @@ func (s *Server) handleTargetItem(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, newError("接口不存在"))
 			return
 		}
+		old, ok := s.store.Get(id)
+		if !ok {
+			writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
+			return
+		}
 		var in targetInput
 		if !decodeJSON(w, r, &in) {
 			return
@@ -175,6 +228,29 @@ func (s *Server) handleTargetItem(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, newError(err.Error()))
 			return
+		}
+		// 仅当 shell 地址（URL）发生变化时才重新探测靶机是否工作正常。
+		if t.URL != old.URL {
+			probe := shell.Execute(r.Context(), shell.ExecOptions{
+				TargetURL: t.URL,
+				Param:     t.Param,
+				Method:    t.Method,
+				Type:      t.ShellType,
+				Command:   "echo " + probeMark,
+				Timeout:   s.cfg.Timeout,
+			})
+			if !probe.OK {
+				msg := probe.Error
+				if msg == "" {
+					msg = "靶机返回非成功状态"
+				}
+				writeJSON(w, http.StatusBadRequest, newError("靶机不可达或 shell 未工作正常: "+msg))
+				return
+			}
+			if !strings.Contains(probe.Output, probeMark) {
+				writeJSON(w, http.StatusBadRequest, newError("shell 回显未包含预期标记，可能连接参数或类型不匹配"))
+				return
+			}
 		}
 		updated, err := s.store.Update(id, t)
 		if err != nil {
@@ -211,6 +287,234 @@ func (s *Server) handleTargetItem(w http.ResponseWriter, r *http.Request) {
 // execInput 是命令执行的请求体。
 type execInput struct {
 	Command string `json:"command"`
+}
+
+// fsInput 是文件写入/删除操作的请求体。
+type fsInput struct {
+	Path   string `json:"path"`
+	Base64 string `json:"base64"`
+}
+
+// handleFS 处理 /api/targets/{id}/fs/{op} 下的文件管理操作。
+// op ∈ {list, read, download, write, upload, delete}：
+//   - list/read/download 用 GET + path 查询参数
+//   - write/upload/delete 用 POST + JSON 体 {path, base64?}
+//
+// 仅 php-eval 类型靶机支持（php-cmd 无法稳妥地做结构化文件读写）。
+func (s *Server) handleFS(w http.ResponseWriter, r *http.Request, id string, sub []string) {
+	if len(sub) == 0 || sub[0] == "" {
+		writeJSON(w, http.StatusNotFound, newError("文件操作不存在"))
+		return
+	}
+	op := sub[0]
+	t, ok := s.store.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
+		return
+	}
+	if t.ShellType != shell.TypeEval {
+		writeJSON(w, http.StatusBadRequest, newError("文件管理仅支持 php-eval 类型靶机"))
+		return
+	}
+	o := shell.ExecOptions{
+		TargetURL: t.URL,
+		Param:     t.Param,
+		Method:    t.Method,
+		Type:      t.ShellType,
+		Timeout:   s.cfg.Timeout,
+	}
+	qx := r.URL.Query()
+
+	switch r.Method {
+	case http.MethodGet:
+		switch op {
+		case "list":
+			dir := qx.Get("path")
+			if dir == "" {
+				dir = "."
+			}
+			entries, resolved, err := shell.FsList(r.Context(), o, dir)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, newError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"path": resolved, "entries": entries})
+		case "read", "download":
+			path := qx.Get("path")
+			if path == "" {
+				writeJSON(w, http.StatusBadRequest, newError("缺少 path 参数"))
+				return
+			}
+			f, err := shell.FsRead(r.Context(), o, path)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, newError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, f)
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, newError("不支持的文件读取操作: "+op))
+		}
+
+	case http.MethodPost:
+		var in fsInput
+		if !decodeJSON(w, r, &in) {
+			return
+		}
+		switch op {
+		case "write", "upload":
+			if in.Path == "" {
+				writeJSON(w, http.StatusBadRequest, newError("缺少 path"))
+				return
+			}
+			if err := shell.FsWrite(r.Context(), o, in.Path, in.Base64); err != nil {
+				writeJSON(w, http.StatusBadRequest, newError(err.Error()))
+				return
+			}
+			s.auditFS(id, "write", in.Path, true)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		case "delete":
+			if in.Path == "" {
+				writeJSON(w, http.StatusBadRequest, newError("缺少 path"))
+				return
+			}
+			if err := shell.FsDelete(r.Context(), o, in.Path); err != nil {
+				writeJSON(w, http.StatusBadRequest, newError(err.Error()))
+				return
+			}
+			s.auditFS(id, "delete", in.Path, true)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, newError("不支持的文件写入操作: "+op))
+		}
+
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, newError("不支持的请求方法"))
+	}
+}
+
+// handleSys 处理 /api/targets/{id}/sys/info：读取靶机系统资源概览。
+// 仅 php-eval 类型靶机支持（需要提交 PHP 采集代码）。
+func (s *Server) handleSys(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, newError("只支持 GET"))
+		return
+	}
+	t, ok := s.store.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
+		return
+	}
+	if t.ShellType != shell.TypeEval {
+		writeJSON(w, http.StatusBadRequest, newError("系统监控仅支持 php-eval 类型靶机"))
+		return
+	}
+	o := shell.ExecOptions{
+		TargetURL: t.URL,
+		Param:     t.Param,
+		Method:    t.Method,
+		Type:      t.ShellType,
+		Timeout:   s.cfg.Timeout,
+	}
+	info, err := shell.Monitor(r.Context(), o)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, newError(err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+// handleProc 处理 /api/targets/{id}/proc/list：读取靶机进程列表（含 PPID）。
+// 仅 php-eval 类型靶机支持（需要提交 PHP 采集代码）。
+func (s *Server) handleProc(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, newError("只支持 GET"))
+		return
+	}
+	t, ok := s.store.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
+		return
+	}
+	if t.ShellType != shell.TypeEval {
+		writeJSON(w, http.StatusBadRequest, newError("进程管理仅支持 php-eval 类型靶机"))
+		return
+	}
+	o := shell.ExecOptions{
+		TargetURL: t.URL,
+		Param:     t.Param,
+		Method:    t.Method,
+		Type:      t.ShellType,
+		Timeout:   s.cfg.Timeout,
+	}
+	info, err := shell.ProcList(r.Context(), o)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, newError(err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+// handleProcKill 处理 /api/targets/{id}/proc/kill：向靶机进程发送信号结束它。
+// 仅 php-eval 类型靶机支持；POST 入参 {pid, signal}，signal 缺省为 15 (SIGTERM)。
+func (s *Server) handleProcKill(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, newError("只支持 POST"))
+		return
+	}
+	t, ok := s.store.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
+		return
+	}
+	if t.ShellType != shell.TypeEval {
+		writeJSON(w, http.StatusBadRequest, newError("进程管理仅支持 php-eval 类型靶机"))
+		return
+	}
+	var in struct {
+		PID    string `json:"pid"`
+		Signal int    `json:"signal"`
+	}
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if in.PID == "" {
+		writeJSON(w, http.StatusBadRequest, newError("缺少 pid"))
+		return
+	}
+	sig := in.Signal
+	if sig == 0 {
+		sig = 15
+	}
+	o := shell.ExecOptions{
+		TargetURL: t.URL,
+		Param:     t.Param,
+		Method:    t.Method,
+		Type:      t.ShellType,
+		Timeout:   s.cfg.Timeout,
+	}
+	res, err := shell.ProcKill(r.Context(), o, in.PID, sig)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, newError(err.Error()))
+		return
+	}
+	ok2, _ := res["ok"].(bool)
+	s.store.TouchLastUsed(id)
+	s.store.AppendRecord(store.CommandRecord{
+		TargetID: id,
+		Command:  "proc:kill " + in.PID + " sig " + strconv.Itoa(sig),
+		OK:       ok2,
+	})
+	writeJSON(w, http.StatusOK, res)
+}
+
+// auditFS 为文件写入/删除操作补一条审计记录。
+func (s *Server) auditFS(id, op, path string, ok bool) {
+	s.store.TouchLastUsed(id)
+	s.store.AppendRecord(store.CommandRecord{
+		TargetID: id,
+		Command:  "fs:" + op + " " + path,
+		OK:       ok,
+	})
 }
 
 // execCommand 对靶标执行一次命令，记录审计日志，并把结果返回给前端。

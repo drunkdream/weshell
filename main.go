@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"weshell/internal/api"
@@ -29,6 +30,7 @@ func main() {
 	timeout := flag.Duration("timeout", 15*time.Second, "单次命令执行的超时时间")
 	auth := flag.String("auth", "", "简易令牌；设置后前端需提供 X-Auth-Token 才能调用接口")
 	lab := flag.String("lab", "", "本机靶机地址，前端常驻显示，例如 http://127.0.0.1:8081/shell.php")
+	accessLog := flag.Bool("access-log", true, "是否打印每个 HTTP 请求的访问日志（默认开启）")
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "[weshell] ", log.LstdFlags|log.LUTC)
@@ -60,9 +62,14 @@ func main() {
 	}))
 	mux.Handle("/", http.FileServer(http.FS(webRoot)))
 
+	handler := http.Handler(mux)
+	if *accessLog {
+		handler = withAccessLog(logger, mux)
+	}
+
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -72,4 +79,59 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Fatalf("服务异常退出: %v", err)
 	}
+}
+
+// withAccessLog 打印每个 HTTP 请求的访问日志：来源、方法、路径、状态码与耗时。
+//
+// 命令执行另有单独的审计日志（见 internal/api），那里记录的是「谁对哪个靶机
+// 执行了什么命令」，与这里的访问日志互补。
+func withAccessLog(logger *log.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+
+		logger.Printf("%s %s %s %d %s",
+			clientIP(r), r.Method, r.URL.RequestURI(), rec.status,
+			time.Since(start).Round(time.Millisecond))
+	})
+}
+
+// statusRecorder 包住 ResponseWriter 以捕获实际写出的状态码。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	// written 用于兜底：若处理器从未显式调用 WriteHeader，则以 200 计。
+	written bool
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if !r.written {
+		r.status = code
+		r.written = true
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if !r.written {
+		r.written = true
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+// clientIP 取客户端地址。优先信任反向代理传递的 X-Forwarded-For，
+// 取不到时退回 TCP 远端地址（去掉端口号）。
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i > 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	host := r.RemoteAddr
+	if i := strings.LastIndexByte(host, ':'); i > 0 {
+		return host[:i]
+	}
+	return host
 }

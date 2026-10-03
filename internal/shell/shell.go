@@ -357,8 +357,8 @@ func fsExec(ctx context.Context, o ExecOptions, phpCode string) (map[string]any,
 }
 
 func asStr(v any) string { s, _ := v.(string); return s }
-func asBool(v any) bool { b, _ := v.(bool); return b }
-func asInt(v any) int64 { f, _ := v.(float64); return int64(f) }
+func asBool(v any) bool  { b, _ := v.(bool); return b }
+func asInt(v any) int64  { f, _ := v.(float64); return int64(f) }
 
 // FsList 列出目录内容。
 func FsList(ctx context.Context, o ExecOptions, dir string) (entries []FSListEntry, resolved string, err error) {

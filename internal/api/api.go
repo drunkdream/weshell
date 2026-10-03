@@ -541,6 +541,13 @@ func (s *Server) execCommand(w http.ResponseWriter, r *http.Request, id string) 
 		Timeout:   s.cfg.Timeout,
 	})
 
+	// 失败时单独打一行，避免「HTTP 200 + body 里 ok:false」把问题藏起来，
+	// 否则只看访问日志会误以为一切正常。
+	if !res.OK {
+		s.logger.Printf("命令执行失败 target=%s<%s> command=%q error=%q latency=%dms",
+			t.Name, t.URL, truncate(in.Command, 300), firstLine(res.Error), res.LatencyMS)
+	}
+
 	s.store.TouchLastUsed(id)
 	s.store.AppendRecord(store.CommandRecord{
 		TargetID:  id,

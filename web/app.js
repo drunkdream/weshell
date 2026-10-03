@@ -130,11 +130,119 @@
     state.targets.forEach((t) => {
       const active = state.current && state.current.id === t.id ? ' active' : '';
       const li = el('li', 'target-item' + active);
-      li.appendChild(el('span', 'tname', t.name));
-      li.appendChild(el('span', 'turl', t.url));
+
+      // 上半行：文字区占满剩余宽度，测试按钮固定在右侧
+      const main = el('div', 'target-main');
+      const text = el('div', 'target-text');
+      text.appendChild(el('span', 'tname', t.name));
+      text.appendChild(el('span', 'turl', t.url));
+
+      const btn = el('button', 'btn-test', '测试');
+      btn.title = '执行一次探针命令，验证该靶机是否可连通、命令能否正常回显';
+      // 阻止冒泡，避免点测试时把列表项也选中了
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        testTarget(t, btn);
+      });
+
+      main.append(text, btn);
+      li.appendChild(main);
       li.addEventListener('click', () => selectTarget(t.id));
       list.appendChild(li);
     });
+  }
+
+  // PROBE_COMMAND 是连通性探针：命令简短、无副作用、输出固定，
+  // 便于判断"靶机可达 + 命令可执行 + 回显能取到"这一整条链路是否正常。
+  const PROBE_COMMAND = 'echo weshell-ok';
+  const PROBE_EXPECT = 'weshell-ok';
+
+  // testTarget 执行一次探针命令，把结果与具体原因显示在列表项下方。
+  async function testTarget(target, btn) {
+    if (btn.dataset.busy === '1') return;
+    btn.dataset.busy = '1';
+    btn.textContent = '测试中';
+    btn.className = 'btn-test testing';
+
+    const li = btn.closest('.target-item');
+    clearTestResult(li);
+
+    let ok = false;
+    let detail = '';
+    try {
+      const res = await post('targets/' + encodeURIComponent(target.id) + '/exec', { command: PROBE_COMMAND });
+      const output = (res && res.output) || '';
+      if (output.includes(PROBE_EXPECT)) {
+        ok = true;
+        detail = '靶机正常响应（' + res.latencyMs + 'ms）';
+      } else {
+        detail = explainFailure(res, output, null);
+      }
+    } catch (err) {
+      detail = explainFailure(null, '', err);
+    }
+
+    btn.textContent = ok ? '正常' : '失败';
+    btn.className = 'btn-test ' + (ok ? 'ok' : 'err');
+    btn.title = detail;
+    btn.dataset.busy = '0';
+    showTestResult(li, ok, detail);
+
+    // 失败时按钮状态保留更久，方便对照下面的原因文字
+    setTimeout(() => {
+      btn.textContent = '测试';
+      btn.className = 'btn-test';
+    }, ok ? 3000 : 10000);
+  }
+
+  // explainFailure 把失败信息翻译成可读且可操作的中文提示。
+  // 原始错误（连接被拒、超时等）往往是一长串英文，直接抛给用户没法定位问题。
+  function explainFailure(res, output, err) {
+    const raw = (err && err.message) || (res && res.error) || '';
+
+    if (raw) {
+      if (/connection refused/i.test(raw)) {
+        return '连接被拒绝：靶机未启动，或 URL 里的端口不对';
+      }
+      if (/no such host|could not resolve|lookup .* on /i.test(raw)) {
+        return '主机名无法解析：检查 URL 中的域名/IP';
+      }
+      if (/timed out|timeout|deadline exceeded/i.test(raw)) {
+        return '请求超时：靶机响应过慢，或网络不通';
+      }
+      if (/certificate|x509|tls/i.test(raw)) {
+        return 'HTTPS 证书校验失败：靶机使用了自签名证书';
+      }
+      const httpMatch = raw.match(/HTTP (\d{3})/);
+      if (httpMatch) {
+        return '靶机返回 HTTP ' + httpMatch[1] + '：URL 路径不对，或该页面需要认证';
+      }
+      return raw;
+    }
+
+    if (res && res.status >= 400) {
+      return '靶机返回 HTTP ' + res.status + '：URL 路径不对，或该页面需要认证';
+    }
+    if (!output) {
+      return '靶机无回显：命令可能没执行成功。常见原因是参数名填错，或 passthru/system 被禁用';
+    }
+    return '未收到预期回显，靶机实际返回：' + output.slice(0, 200);
+  }
+
+  function clearTestResult(li) {
+    if (!li) return;
+    const old = li.querySelector('.test-result');
+    if (old) old.remove();
+  }
+
+  // showTestResult 把结果直接显示在列表项下方。
+  // 不能只放 title 属性——手机浏览器没有 hover，tooltip 根本看不到。
+  function showTestResult(li, ok, detail) {
+    if (!li) return;
+    clearTestResult(li);
+    const box = el('div', 'test-result ' + (ok ? 'ok' : 'err'), (ok ? '✓ ' : '✗ ') + detail);
+    li.appendChild(box);
+    setTimeout(() => box.remove(), ok ? 5000 : 20000);
   }
 
   function selectTarget(id) {

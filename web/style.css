@@ -376,6 +376,7 @@ code, pre, input, select {
 
 	/* iOS 上输入框字号小于 16px 时，聚焦会触发页面自动放大 */
 	.prompt input,
+	.fs-path,
 	.modal-card input,
 	.modal-card select { font-size: 16px; }
 
@@ -396,3 +397,170 @@ code, pre, input, select {
 	.body-text { max-height: 50vh; }
 	.hints { font-size: 11px; }
 }
+
+/* ---------- 标签页 ---------- */
+.tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 13px;
+}
+.tab:hover { border-color: var(--accent); color: var(--fg); }
+.tab.active { background: var(--bg-hover); border-color: var(--accent); color: var(--accent); }
+.tab-ico { width: 16px; height: 16px; flex: 0 0 auto; }
+
+/* ---------- 文件管理 ---------- */
+.fs-panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  padding: 12px;
+}
+.fs-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.fs-toolbar .spacer { flex: 1; }
+.fs-path-label { font-size: 12px; color: var(--fg-dim); white-space: nowrap; }
+.fs-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+.fs-path:focus { outline: none; border-color: var(--accent); }
+.fs-list { list-style: none; margin: 0; padding: 0; max-height: 52vh; overflow: auto; }
+.fs-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.fs-row:hover { background: var(--bg-hover); }
+.fs-row.is-dir .fs-name { color: var(--accent); }
+.fs-name { flex: 1; font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
+.fs-meta { color: var(--fg-dim); font-size: 12px; white-space: nowrap; }
+.fs-acts { display: flex; gap: 6px; }
+.fs-hint { color: var(--fg-dim); font-style: italic; cursor: default; }
+.fs-err { color: var(--danger); cursor: default; }
+.fs-editor { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
+.fs-editor-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.fs-edit-name { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+.fs-editor-body { display: flex; align-items: stretch; }
+.fs-gutter {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 12px 8px 12px 10px;
+  background: #0b0f14;
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+  border-right: 0;
+  border-radius: 8px 0 0 8px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  text-align: right;
+  white-space: pre;
+  user-select: none;
+  overflow: hidden;
+  min-width: 3.2em;
+}
+.fs-editor textarea {
+  flex: 1 1 auto;
+  width: auto;
+  min-height: 280px;
+  resize: vertical;
+  padding: 12px;
+  background: #010409;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 0 8px 8px 0;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre;
+  overflow: auto;
+  tab-size: 4;
+}
+.fs-editor textarea:focus { outline: none; border-color: var(--accent); }
+.btn.xs { padding: 3px 9px; font-size: 12px; }
+
+/* ---------- 系统监控 ---------- */
+.sys-panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  padding: 12px;
+}
+.sys-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.sys-toolbar .spacer { flex: 1; }
+.sys-auto { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-dim); cursor: pointer; }
+.sys-auto input { accent-color: var(--accent); }
+.sys-updated { font-size: 11.5px; color: var(--fg-dim); }
+.sys-body { display: flex; flex-direction: column; gap: 12px; }
+.sys-cards { display: flex; flex-wrap: wrap; gap: 10px; }
+.sys-card {
+  flex: 1 1 160px;
+  min-width: 140px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  padding: 10px 12px;
+}
+.sys-card.wide { flex-basis: 100%; }
+.sys-card-title { font-size: 12px; color: var(--fg-dim); margin-bottom: 6px; }
+.sys-card-val { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 14px; word-break: break-all; }
+.sys-card-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; }
+.sys-card-row .sys-k { flex: 0 0 96px; color: var(--fg-dim); font-size: 12px; }
+.sys-card-row .sys-v { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; word-break: break-all; }
+.sys-bar-wrap { flex: 1; display: flex; align-items: center; gap: 8px; }
+.sys-bar { flex: 1; height: 8px; border-radius: 999px; background: var(--bg-hover); overflow: hidden; }
+.sys-bar-fill { height: 100%; background: var(--accent); border-radius: 999px; }
+.sys-bar-pct { flex: 0 0 auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: var(--fg-dim); }
+.sys-proc-wrap { max-height: 46vh; overflow: auto; margin-top: 6px; border: 1px solid var(--border); border-radius: 6px; }
+.sys-proc { width: 100%; border-collapse: collapse; font-size: 12px; }
+.sys-proc th, .sys-proc td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.sys-proc th { position: sticky; top: 0; background: var(--bg-hover); color: var(--fg-dim); font-weight: 600; }
+.sys-proc tr:hover td { background: var(--bg-hover); }
+.sys-proc .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+
+/* ---------- 进程管理 ---------- */
+.proc-panel { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-soft); padding: 12px; }
+.proc-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+.proc-auto { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-dim); cursor: pointer; }
+.proc-auto input { accent-color: var(--accent); }
+.proc-views { display: inline-flex; gap: 4px; }
+.proc-views .active { border-color: var(--accent); color: var(--accent); }
+.proc-search { flex: 0 1 220px; min-width: 120px; padding: 5px 9px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
+.proc-search:focus { outline: none; border-color: var(--accent); }
+.proc-body { max-height: 60vh; overflow: auto; border: 1px solid var(--border); border-radius: 6px; }
+.proc-tree { list-style: none; margin: 0; padding: 0; }
+.proc-node { margin: 0; }
+.proc-children { list-style: none; margin: 0; padding-left: 18px; border-left: 1px dashed var(--border); }
+.proc-row { display: flex; align-items: center; gap: 8px; padding: 3px 8px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; white-space: nowrap; }
+.proc-row:hover { background: var(--bg-hover); }
+.proc-toggle { flex: 0 0 14px; text-align: center; color: var(--fg-dim); cursor: pointer; user-select: none; }
+.proc-toggle.leaf { cursor: default; color: var(--border); }
+.proc-pid { flex: 0 0 64px; color: var(--accent); }
+.proc-user { flex: 0 0 84px; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; }
+.proc-cpu { flex: 0 0 56px; color: var(--fg-dim); }
+.proc-cmd { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.proc-node.collapsed > .proc-children { display: none; }
+.proc-hit > .proc-cmd, .proc-hit > .proc-pid { color: #ff4da6; font-weight: 600; }
+tr.proc-hit { background: rgba(255, 77, 166, 0.10); }
+.proc-sel, tr.proc-sel { background: rgba(255, 77, 77, 0.20); }
+.proc-row.proc-sel:hover { background: rgba(255, 77, 77, 0.28); }
+.proc-cb { flex: 0 0 auto; width: 15px; height: 15px; accent-color: var(--accent); margin: 0; cursor: pointer; }
+.proc-cb-cell { width: 26px; text-align: center; padding-left: 8px !important; }
+.sys-proc thead .proc-cb-cell { padding-top: 8px; }

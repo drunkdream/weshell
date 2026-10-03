@@ -54,28 +54,102 @@
         </div>
       </div>
 
-      <div class="quick">
-        <span class="label">快捷命令</span>
-        <button class="chip" data-cmd="whoami">whoami</button>
-        <button class="chip" data-cmd="id">id</button>
-        <button class="chip" data-cmd="uname -a">uname -a</button>
-        <button class="chip" data-cmd="pwd">pwd</button>
-        <button class="chip" data-cmd="ls -la">ls -la</button>
-        <button class="chip" data-cmd="ip addr">ip addr</button>
-        <button class="chip" data-cmd="cat /etc/passwd">cat /etc/passwd</button>
+      <div class="tabs">
+        <button class="tab active" data-tab="sys">
+          <svg class="tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg>
+          <span>系统</span>
+        </button>
+        <button class="tab" data-tab="term">
+          <svg class="tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          <span>终端</span>
+        </button>
+        <button class="tab" data-tab="fs">
+          <svg class="tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          <span>文件</span>
+        </button>
+        <button class="tab" data-tab="proc">
+          <svg class="tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M6 8.5v7"/><path d="M18 12h-7.5a3 3 0 0 1-3 3"/></svg>
+          <span>进程</span>
+        </button>
       </div>
 
-      <div class="console">
-        <div class="prompt">
-          <span class="dollar">$</span>
-          <input id="cmdInput" type="text" spellcheck="false" autocomplete="off"
-                 placeholder="输入命令，回车执行；↑ / ↓ 翻阅历史">
-          <button id="btnRun" class="btn primary">执行</button>
+      <div id="termPanel">
+        <div class="quick">
+          <span class="label">快捷命令</span>
+          <button class="chip" data-cmd="whoami">whoami</button>
+          <button class="chip" data-cmd="id">id</button>
+          <button class="chip" data-cmd="uname -a">uname -a</button>
+          <button class="chip" data-cmd="pwd">pwd</button>
+          <button class="chip" data-cmd="ls -la">ls -la</button>
+          <button class="chip" data-cmd="ip addr">ip addr</button>
+          <button class="chip" data-cmd="cat /etc/passwd">cat /etc/passwd</button>
         </div>
-        <div class="hints">Ctrl + Enter 换行无效 · 回车即执行 · 命令通过 ↑↓ 复用</div>
+
+        <div class="console">
+          <div class="prompt">
+            <span class="dollar">$</span>
+            <input id="cmdInput" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="输入命令，回车执行；↑ / ↓ 翻阅历史">
+            <button id="btnRun" class="btn primary">执行</button>
+          </div>
+          <div class="hints">Ctrl + Enter 换行无效 · 回车即执行 · 命令通过 ↑↓ 复用</div>
+        </div>
+
+        <div id="output" class="output" aria-live="polite"></div>
       </div>
 
-      <div id="output" class="output" aria-live="polite"></div>
+      <div id="fsPanel" class="fs-panel hidden">
+        <div class="fs-toolbar">
+          <button id="fsUp" class="btn ghost">↑ 上级</button>
+          <span class="fs-path-label">当前目录</span>
+          <input id="fsPath" class="fs-path" type="text" spellcheck="false" autocomplete="off" placeholder="输入目录路径，回车切换">
+          <span class="spacer"></span>
+          <button id="fsNew" class="btn ghost">新建文件</button>
+          <button id="fsUpload" class="btn primary">上传</button>
+        </div>
+        <ul id="fsList" class="fs-list"></ul>
+        <div id="fsEditor" class="fs-editor hidden">
+          <div class="fs-editor-head">
+            <span id="fsEditName" class="fs-edit-name"></span>
+            <span class="spacer"></span>
+            <button id="fsSave" class="btn primary">保存</button>
+            <button id="fsEditClose" class="btn ghost">关闭</button>
+          </div>
+          <div class="fs-editor-body">
+            <pre id="fsGutter" class="fs-gutter" aria-hidden="true"></pre>
+            <textarea id="fsContent" spellcheck="false"></textarea>
+          </div>
+        </div>
+        <input id="fsFileInput" type="file" class="hidden">
+      </div>
+
+      <div id="sysPanel" class="sys-panel hidden">
+        <div class="sys-toolbar">
+          <button id="sysRefresh" class="btn primary">刷新</button>
+          <label class="sys-auto"><input type="checkbox" id="sysAuto"> 自动刷新（3s）</label>
+          <span class="spacer"></span>
+          <span id="sysUpdated" class="sys-updated"></span>
+        </div>
+        <div id="sysBody" class="sys-body"></div>
+      </div>
+
+      <div id="procPanel" class="proc-panel hidden">
+        <div class="proc-toolbar">
+          <button id="procRefresh" class="btn primary">刷新</button>
+          <label class="proc-auto"><input type="checkbox" id="procAuto"> 自动刷新（3s）</label>
+          <div class="proc-views" role="group">
+            <button class="btn ghost xs active" data-pview="tree">树形</button>
+            <button class="btn ghost xs" data-pview="list">列表</button>
+          </div>
+          <label class="proc-auto"><input type="checkbox" id="procAll"> 全选</label>
+          <button id="procKill" class="btn danger">结束进程</button>
+          <label class="proc-auto"><input type="checkbox" id="procForce"> 强制 SIGKILL</label>
+          <span class="spacer"></span>
+          <input id="procSearch" class="proc-search" type="text" spellcheck="false" placeholder="过滤：进程名 / 用户 / PID">
+          <span id="procUpdated" class="sys-updated"></span>
+        </div>
+        <div id="procBody" class="proc-body"></div>
+      </div>
     </div>
   </section>
 </main>

@@ -104,6 +104,16 @@
     timeoutMs: 20000,
     // 当前进行中的请求，用于「取消」
     abort: null,
+    // 文件管理当前所在目录
+    fsPath: '.',
+    // 系统监控自动刷新定时器
+    sysTimer: null,
+    // 进程管理：自动刷新定时器 / 当前视图 / 最近一次原始数据
+    procTimer: null,
+    procView: 'tree',
+    procRaw: [],
+    // 当前勾选的进程 PID 集合（用于「结束进程」批量操作）
+    procSel: new Set(),
   };
 
   // ---------- 列表渲染 ----------
@@ -144,6 +154,20 @@
       target.url,
     ].join(' · ');
     $('output').textContent = '';
+    showTab('sys');
+    state.fsPath = '.';
+    $('fsPath').value = '.';
+    $('fsList').textContent = '';
+    $('fsEditor').classList.add('hidden');
+    stopSysAuto();
+    $('sysBody').textContent = '';
+    $('sysUpdated').textContent = '';
+    stopProcAuto();
+    $('procBody').textContent = '';
+    $('procUpdated').textContent = '';
+    $('procSearch').value = '';
+    state.procSel.clear();
+    $('procAll').checked = false;
     $('cmdInput').focus();
   }
 
@@ -421,6 +445,541 @@
     box.hidden = false;
   }
 
+  // ---------- 文件管理 ----------
+
+  // 在终端 / 文件两个标签页间切换；切到文件时若尚未加载则拉取当前目录。
+  function showTab(name) {
+    const term = name === 'term';
+    $('termPanel').classList.toggle('hidden', !term);
+    $('fsPanel').classList.toggle('hidden', term || name !== 'fs');
+    $('sysPanel').classList.toggle('hidden', name !== 'sys');
+    $('procPanel').classList.toggle('hidden', name !== 'proc');
+    document.querySelectorAll('.tab').forEach((b) => {
+      b.classList.toggle('active', b.dataset.tab === name);
+    });
+    if (name === 'fs' && state.current && !$('fsList').childElementCount) {
+      loadFs(state.fsPath);
+    }
+    if (name === 'sys' && state.current) {
+      loadSys();
+    }
+    if (name === 'proc' && state.current) {
+      loadProc();
+    }
+  }
+
+  // 读取靶机系统资源概览：GET /api/targets/{id}/sys/info
+  async function loadSys() {
+    if (!state.current) return;
+    const body = $('sysBody');
+    if (!body.childElementCount) body.appendChild(el('div', 'fs-hint', '加载中…'));
+    try {
+      const d = await api('targets/' + encodeURIComponent(state.current.id) + '/sys/info');
+      renderSys(d, body);
+      $('sysUpdated').textContent = '更新于 ' + new Date().toLocaleTimeString();
+    } catch (err) {
+      body.textContent = '';
+      body.appendChild(el('div', 'fs-err', '加载失败：' + err.message));
+    }
+  }
+
+  function fmtBytes(b) {
+    b = Number(b) || 0;
+    if (b <= 0) return '0 B';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0, n = b;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i === 0 ? n.toFixed(0) : n.toFixed(n >= 10 ? 0 : 1)) + ' ' + u[i];
+  }
+
+  function fmtDuration(sec) {
+    sec = Math.floor(sec);
+    const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600),
+      m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    const parts = [];
+    if (d) parts.push(d + '天');
+    if (h) parts.push(h + '时');
+    if (m) parts.push(m + '分');
+    parts.push(s + '秒');
+    return parts.join('');
+  }
+
+  function pct(v) {
+    const n = Number(v);
+    if (!isFinite(n)) return 0;
+    return Math.max(0, Math.min(100, n * 100));
+  }
+
+  function sysCard(title, val) {
+    const c = el('div', 'sys-card');
+    c.appendChild(el('div', 'sys-card-title', title));
+    c.appendChild(el('div', 'sys-card-val', String(val)));
+    return c;
+  }
+
+  function progressRow(label, percent) {
+    const row = el('div', 'sys-card-row');
+    row.appendChild(el('span', 'sys-k', label));
+    const bar = el('div', 'sys-bar');
+    const fill = el('div', 'sys-bar-fill');
+    fill.style.width = pct(percent / 100) + '%';
+    bar.appendChild(fill);
+    const wrap = el('div', 'sys-bar-wrap');
+    wrap.appendChild(bar);
+    wrap.appendChild(el('span', 'sys-bar-pct', pct(percent / 100).toFixed(0) + '%'));
+    row.appendChild(wrap);
+    return row;
+  }
+
+  function renderSys(d, body) {
+    body.textContent = '';
+    const over = el('div', 'sys-cards');
+    over.appendChild(sysCard('主机', d.hostname || '—'));
+    over.appendChild(sysCard('系统', d.os || '—'));
+    const up = (d.uptime || '').toString().split(/\s+/)[0];
+    over.appendChild(sysCard('运行时长', up ? fmtDuration(parseFloat(up)) : '—'));
+    const la = Array.isArray(d.loadavg) ? d.loadavg : [];
+    over.appendChild(sysCard('负载 (1/5/15)', la.join(' / ') || '—'));
+    body.appendChild(over);
+
+    const cpu = d.cpu || {};
+    const cpuCard = el('div', 'sys-card wide');
+    cpuCard.appendChild(el('div', 'sys-card-title', 'CPU'));
+    const cr = el('div', 'sys-card-row');
+    cr.appendChild(el('span', 'sys-k', '核心数'));
+    cr.appendChild(el('span', 'sys-v', String(cpu.cores || '—')));
+    cpuCard.appendChild(cr);
+    if (cpu.model) {
+      const mr = el('div', 'sys-card-row');
+      mr.appendChild(el('span', 'sys-k', '型号'));
+      mr.appendChild(el('span', 'sys-v', cpu.model));
+      cpuCard.appendChild(mr);
+    }
+    cpuCard.appendChild(progressRow('使用率', pct(cpu.usage)));
+    body.appendChild(cpuCard);
+
+    const mem = d.mem || {};
+    const total = Number(mem.MemTotal) || 0;
+    const avail = Number(mem.MemAvailable) || Number(mem.MemFree) || 0;
+    const used = total - avail;
+    const memCard = el('div', 'sys-card wide');
+    memCard.appendChild(el('div', 'sys-card-title', '内存'));
+    const mrow = el('div', 'sys-card-row');
+    mrow.appendChild(el('span', 'sys-k', '已用 / 总量'));
+    mrow.appendChild(el('span', 'sys-v', fmtBytes(used) + ' / ' + fmtBytes(total)));
+    memCard.appendChild(mrow);
+    memCard.appendChild(progressRow('占用', total > 0 ? (used / total) * 100 : 0));
+    body.appendChild(memCard);
+
+    const disks = Array.isArray(d.disks) ? d.disks : [];
+    // 过滤掉 tmpfs / proc / sysfs 等虚拟文件系统，仅聚焦真实磁盘（根挂载点始终保留）
+    const skipFs = new Set(['tmpfs', 'devtmpfs', 'proc', 'sysfs', 'cgroup', 'cgroup2', 'mqueue', 'debugfs', 'tracefs', 'securityfs', 'pstore', 'bpf', 'configfs', 'fusectl', 'hugetlbfs', 'autofs', 'binfmt_misc', 'rpc_pipefs', 'nsfs']);
+    const show = disks.filter((dk) => dk.mount === '/' || !skipFs.has(dk.fs));
+    const diskCard = el('div', 'sys-card wide');
+    diskCard.appendChild(el('div', 'sys-card-title', '硬盘（共 ' + show.length + ' 个挂载点）'));
+    if (!show.length) {
+      diskCard.appendChild(el('div', 'fs-hint', '（无数据，靶机可能禁用了 shell_exec / df）'));
+    } else {
+      show.forEach((dk) => {
+        const r = el('div', 'sys-card-row');
+        const mp = dk.mount + (dk.fs ? '  (' + dk.fs + ')' : '');
+        r.appendChild(el('span', 'sys-k', mp));
+        r.appendChild(el('span', 'sys-v', fmtBytes(Number(dk.used)) + ' / ' + fmtBytes(Number(dk.total))));
+        diskCard.appendChild(r);
+        diskCard.appendChild(progressRow('使用率', Number(dk.use) || 0));
+      });
+    }
+    body.appendChild(diskCard);
+
+  }
+
+  // ---------- 进程管理（独立页） ----------
+
+  // 读取靶机进程列表：GET /api/targets/{id}/proc/list
+  async function loadProc() {
+    if (!state.current) return;
+    const body = $('procBody');
+    if (!body.childElementCount) body.appendChild(el('div', 'fs-hint', '加载中…'));
+    try {
+      const d = await api('targets/' + encodeURIComponent(state.current.id) + '/proc/list');
+      state.procRaw = Array.isArray(d.procs) ? d.procs : [];
+      renderProc();
+      $('procUpdated').textContent = '更新于 ' + new Date().toLocaleTimeString();
+    } catch (err) {
+      body.textContent = '';
+      body.appendChild(el('div', 'fs-err', '加载失败：' + err.message));
+    }
+  }
+
+  function stopProcAuto() {
+    if (state.procTimer) { clearInterval(state.procTimer); state.procTimer = null; }
+    const cb = $('procAuto');
+    if (cb) cb.checked = false;
+  }
+
+  // 按当前视图（树形 / 列表）与搜索词渲染进程。
+  function renderProc() {
+    const body = $('procBody');
+    body.textContent = '';
+    const procs = state.procRaw || [];
+    const q = ($('procSearch').value || '').trim().toLowerCase();
+    if (!procs.length) {
+      body.appendChild(el('div', 'fs-hint', '（无数据，靶机可能禁用了 shell_exec / ps）'));
+      return;
+    }
+    if (state.procView === 'tree') renderProcTree(procs, q, body);
+    else renderProcList(procs, q, body);
+  }
+
+  // 由 (pid, ppid) 构建森林：父进程不存在于列表中的即根；子进程按 PID 排序。
+  function buildForest(procs) {
+    const byPid = new Map();
+    procs.forEach((p) => byPid.set(String(p.pid), p));
+    procs.forEach((p) => { p._children = []; });
+    const roots = [];
+    procs.forEach((p) => {
+      const parent = byPid.get(String(p.ppid));
+      if (parent && parent !== p) parent._children.push(p);
+      else roots.push(p);
+    });
+    const sortRec = (n) => { n._children.sort((a, b) => Number(a.pid) - Number(b.pid)); n._children.forEach(sortRec); };
+    roots.sort((a, b) => Number(a.pid) - Number(b.pid));
+    roots.forEach(sortRec);
+    return roots;
+  }
+
+  function renderProcTree(procs, q, body) {
+    const forest = buildForest(procs);
+    const selfMatch = (p) => !q ? false :
+      (String(p.pid).toLowerCase().includes(q) ||
+       String(p.user).toLowerCase().includes(q) ||
+       String(p.cmd).toLowerCase().includes(q));
+    const mark = (node) => {
+      node._self = selfMatch(node);
+      let any = node._self;
+      node._children.forEach((c) => { if (mark(c)) any = true; });
+      node._any = any;
+      return any;
+    };
+    forest.forEach(mark);
+
+    const tree = el('ul', 'proc-tree');
+    const renderNode = (node) => {
+      if (q && !node._any) return null;
+      const li = el('li', 'proc-node');
+      const row = el('div', 'proc-row');
+      const pid = String(node.pid);
+      const cb = el('input', 'proc-cb');
+      cb.type = 'checkbox';
+      cb.value = pid;
+      cb.checked = state.procSel.has(pid);
+      cb.addEventListener('click', (ev) => ev.stopPropagation());
+      cb.addEventListener('change', () => {
+        if (cb.checked) state.procSel.add(pid); else state.procSel.delete(pid);
+        row.classList.toggle('proc-sel', cb.checked);
+        updateProcKillBtn();
+      });
+      if (cb.checked) row.classList.add('proc-sel');
+      row.appendChild(cb);
+      const hasKids = node._children.length > 0;
+      const toggle = el('span', 'proc-toggle' + (hasKids ? '' : ' leaf'));
+      if (hasKids) {
+        toggle.textContent = '▾';
+        toggle.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          const collapsed = li.classList.toggle('collapsed');
+          toggle.textContent = collapsed ? '▸' : '▾';
+        });
+      } else {
+        toggle.textContent = '•';
+      }
+      row.appendChild(toggle);
+      row.appendChild(el('span', 'mono proc-pid', String(node.pid)));
+      row.appendChild(el('span', 'mono proc-user', node.user));
+      row.appendChild(el('span', 'mono proc-cpu', (Number(node.cpu) || 0).toFixed(1) + '%'));
+      row.appendChild(el('span', 'proc-cmd', node.cmd));
+      if (node._self) row.classList.add('proc-hit');
+      li.appendChild(row);
+      if (hasKids) {
+        const ul = el('ul', 'proc-children');
+        node._children.forEach((c) => {
+          const child = renderNode(c);
+          if (child) ul.appendChild(child);
+        });
+        li.appendChild(ul);
+      }
+      return li;
+    };
+    forest.forEach((n) => {
+      const li = renderNode(n);
+      if (li) tree.appendChild(li);
+    });
+    body.appendChild(tree);
+  }
+
+  function renderProcList(procs, q, body) {
+    let list = procs;
+    if (q) {
+      list = procs.filter((p) =>
+        String(p.pid).toLowerCase().includes(q) ||
+        String(p.user).toLowerCase().includes(q) ||
+        String(p.cmd).toLowerCase().includes(q));
+    }
+    const sorted = list.slice().sort((a, b) => (Number(b.cpu) || 0) - (Number(a.cpu) || 0));
+    const tbl = el('table', 'sys-proc');
+    const thead = el('tr', '');
+    ['', 'PID', 'PPID', '用户', 'CPU%', '内存%', '命令'].forEach((h) => thead.appendChild(el('th', h === '' ? 'proc-cb-cell' : '', h)));
+    tbl.appendChild(thead);
+    sorted.forEach((p) => {
+      const tr = el('tr', '');
+      const pid = String(p.pid);
+      const cb = el('input', 'proc-cb');
+      cb.type = 'checkbox';
+      cb.value = pid;
+      cb.checked = state.procSel.has(pid);
+      cb.addEventListener('change', () => {
+        if (cb.checked) state.procSel.add(pid); else state.procSel.delete(pid);
+        tr.classList.toggle('proc-sel', cb.checked);
+        updateProcKillBtn();
+      });
+      if (cb.checked) tr.classList.add('proc-sel');
+      const cbTd = el('td', 'proc-cb-cell');
+      cbTd.appendChild(cb);
+      tr.appendChild(cbTd);
+      tr.appendChild(el('td', 'mono', String(p.pid)));
+      tr.appendChild(el('td', 'mono', String(p.ppid)));
+      tr.appendChild(el('td', 'mono', String(p.user)));
+      tr.appendChild(el('td', 'mono', (Number(p.cpu) || 0).toFixed(1)));
+      tr.appendChild(el('td', 'mono', (Number(p.mem) || 0).toFixed(1)));
+      tr.appendChild(el('td', 'mono', String(p.cmd)));
+      tbl.appendChild(tr);
+    });
+    const wrap = el('div', 'sys-proc-wrap');
+    wrap.appendChild(tbl);
+    body.appendChild(wrap);
+  }
+
+  // 更新「结束进程」按钮文字，显示当前勾选数量。
+  function updateProcKillBtn() {
+    const b = $('procKill');
+    if (!b) return;
+    const n = state.procSel.size;
+    b.textContent = n ? '结束进程 (' + n + ')' : '结束进程';
+  }
+
+  // 结束当前勾选的进程（可批量）：POST /api/targets/{id}/proc/kill
+  async function killProc() {
+    if (!state.current) return;
+    const ids = Array.from(state.procSel);
+    if (!ids.length) { toast('请先勾选要结束的进程'); return; }
+    const sig = $('procForce').checked ? 9 : 15;
+    const label = sig === 9 ? 'SIGKILL' : 'SIGTERM';
+    if (!confirm('确认向选中的 ' + ids.length + ' 个进程发送 ' + label + ' 信号？')) return;
+    let okCount = 0, failCount = 0;
+    await Promise.all(ids.map(async (pid) => {
+      try {
+        const r = await post('targets/' + encodeURIComponent(state.current.id) + '/proc/kill', { pid, signal: sig });
+        if (r && r.ok) okCount++; else failCount++;
+      } catch (e) {
+        failCount++;
+      }
+    }));
+    toast('已发送 ' + label + '：成功 ' + okCount + '，失败 ' + failCount);
+    state.procSel.clear();
+    $('procAll').checked = false;
+    loadProc();
+  }
+
+  function stopSysAuto() {
+    if (state.sysTimer) { clearInterval(state.sysTimer); state.sysTimer = null; }
+    const cb = $('sysAuto');
+    if (cb) cb.checked = false;
+  }
+
+  // UTF-8 字符串 <-> base64（靶机以 base64 回传文件内容，避免二进制/特殊字符破坏回显截取）。
+  function b64encodeUtf8(str) {
+    const bytes = new TextEncoder().encode(str);
+    let bin = '';
+    bytes.forEach((b) => (bin += String.fromCharCode(b)));
+    return btoa(bin);
+  }
+  function b64decodeUtf8(b64) {
+    const bin = atob(b64);
+    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  }
+  function fileToB64(file) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => {
+        const bytes = new Uint8Array(fr.result);
+        let bin = '';
+        bytes.forEach((b) => (bin += String.fromCharCode(b)));
+        resolve(btoa(bin));
+      };
+      fr.onerror = reject;
+      fr.readAsArrayBuffer(file);
+    });
+  }
+  function downloadB64(name, b64) {
+    const bin = atob(b64);
+    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    const blob = new Blob([bytes]);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  // 从输入框跳转到目录：相对路径基于当前目录解析为绝对路径再请求
+  function navigateFs(raw) {
+    let dir = (raw || '').trim();
+    if (!dir) {
+      loadFs(state.fsPath);
+      return;
+    }
+    if (dir !== '/' && !dir.startsWith('/')) {
+      const base = state.fsPath === '.' ? '' : state.fsPath.replace(/\/+$/, '');
+      dir = base ? base + '/' + dir : dir;
+    }
+    loadFs(dir);
+  }
+
+  // 列出目录：GET /api/targets/{id}/fs/list?path=
+  async function loadFs(dir) {
+    if (!state.current) return;
+    state.fsPath = dir;
+    $('fsPath').value = dir;
+    const list = $('fsList');
+    list.textContent = '';
+    list.appendChild(el('li', 'fs-row fs-hint', '加载中…'));
+    try {
+      const data = await api('targets/' + encodeURIComponent(state.current.id) + '/fs/list?path=' + encodeURIComponent(dir));
+      const cur = data.path || dir;
+      state.fsPath = cur;
+      $('fsPath').value = cur;
+      list.textContent = '';
+      if (!data.entries.length) {
+        list.appendChild(el('li', 'fs-row fs-hint', '（空目录）'));
+      }
+      data.entries.forEach((e) => {
+        const li = el('li', 'fs-row' + (e.isDir ? ' is-dir' : ''));
+        li.appendChild(el('span', 'fs-name', e.name + (e.isDir ? '/' : '')));
+        li.appendChild(el('span', 'fs-meta', e.isDir ? '目录' : (e.size + ' B · ' + e.mode)));
+        li.addEventListener('click', () => {
+          if (e.isDir) loadFs(e.path);
+          else openFsFile(e.path, e.name);
+        });
+        const acts = el('span', 'fs-acts');
+        if (!e.isDir) {
+          const ed = el('button', 'btn ghost xs', '编辑');
+          ed.addEventListener('click', (ev) => { ev.stopPropagation(); openFsFile(e.path, e.name); });
+          acts.appendChild(ed);
+          const dl = el('button', 'btn ghost xs', '下载');
+          dl.addEventListener('click', (ev) => { ev.stopPropagation(); downloadFs(e.path, e.name); });
+          acts.appendChild(dl);
+        }
+        const del = el('button', 'btn danger xs', '删');
+        del.addEventListener('click', (ev) => { ev.stopPropagation(); deleteFs(e.path); });
+        acts.appendChild(del);
+        li.appendChild(acts);
+        list.appendChild(li);
+      });
+    } catch (err) {
+      list.textContent = '';
+      list.appendChild(el('li', 'fs-row fs-err', '加载失败：' + err.message));
+    }
+  }
+
+  // 根据编辑器内容重算左侧行号，并同步滚动位置（与 textarea 逐行对齐）。
+  function syncFsGutter() {
+    const ta = $('fsContent');
+    const gut = $('fsGutter');
+    const n = ta.value.split('\n').length;
+    let s = '';
+    for (let i = 1; i <= n; i++) s += i + '\n';
+    gut.textContent = s;
+    gut.scrollTop = ta.scrollTop;
+  }
+
+  // 读取文件到编辑器：GET /api/targets/{id}/fs/read?path=
+  async function openFsFile(path, name) {
+    try {
+      const f = await api('targets/' + encodeURIComponent(state.current.id) + '/fs/read?path=' + encodeURIComponent(path));
+      $('fsEditName').textContent = name + '  (' + f.size + ' B)';
+      $('fsContent').value = b64decodeUtf8(f.base64);
+      $('fsEditor').dataset.path = path;
+      $('fsEditor').classList.remove('hidden');
+      syncFsGutter();
+    } catch (err) {
+      toast('读取失败：' + err.message);
+    }
+  }
+
+  // 保存编辑器内容：POST /api/targets/{id}/fs/write
+  async function saveFsFile() {
+    const path = $('fsEditor').dataset.path;
+    if (!path) return;
+    try {
+      await post('targets/' + encodeURIComponent(state.current.id) + '/fs/write', {
+        path,
+        base64: b64encodeUtf8($('fsContent').value),
+      });
+      toast('已保存 ' + path);
+      $('fsEditor').classList.add('hidden');
+      loadFs(state.fsPath);
+    } catch (err) {
+      toast('保存失败：' + err.message);
+    }
+  }
+
+  async function deleteFs(path) {
+    if (!confirm('确认删除 ' + path + '？')) return;
+    try {
+      await post('targets/' + encodeURIComponent(state.current.id) + '/fs/delete', { path });
+      toast('已删除 ' + path);
+      loadFs(state.fsPath);
+    } catch (err) {
+      toast('删除失败：' + err.message);
+    }
+  }
+
+  async function downloadFs(path, name) {
+    try {
+      const f = await api('targets/' + encodeURIComponent(state.current.id) + '/fs/download?path=' + encodeURIComponent(path));
+      downloadB64(name, f.base64);
+    } catch (err) {
+      toast('下载失败：' + err.message);
+    }
+  }
+
+  async function uploadFs(file) {
+    if (!file) return;
+    const dir = state.fsPath === '.' ? '.' : state.fsPath.replace(/\/$/, '');
+    const path = dir === '.' ? file.name : dir + '/' + file.name;
+    try {
+      const b64 = await fileToB64(file);
+      await post('targets/' + encodeURIComponent(state.current.id) + '/fs/upload', { path, base64: b64 });
+      toast('已上传 ' + path);
+      loadFs(state.fsPath);
+    } catch (err) {
+      toast('上传失败：' + err.message);
+    }
+  }
+
+  function newFsFile() {
+    const name = prompt('新文件名（将创建于当前目录 ' + state.fsPath + '）：');
+    if (!name) return;
+    const dir = state.fsPath === '.' ? '.' : state.fsPath.replace(/\/$/, '');
+    const path = dir === '.' ? name : dir + '/' + name;
+    $('fsEditName').textContent = name + '  (新建)';
+    $('fsContent').value = '';
+    $('fsEditor').dataset.path = path;
+    $('fsEditor').classList.remove('hidden');
+    syncFsGutter();
+  }
+
   // ---------- 事件绑定 ----------
 
   function bind() {
@@ -466,6 +1025,75 @@
         $('cmdInput').value = chip.dataset.cmd;
         $('cmdInput').focus();
       });
+    });
+
+    // 文件管理相关事件
+    document.querySelectorAll('.tab').forEach((b) => {
+      b.addEventListener('click', () => showTab(b.dataset.tab));
+    });
+    $('sysRefresh').addEventListener('click', loadSys);
+    $('sysAuto').addEventListener('change', (ev) => {
+      stopSysAuto();
+      if (ev.target.checked) {
+        loadSys();
+        state.sysTimer = setInterval(loadSys, 3000);
+      }
+    });
+    $('procRefresh').addEventListener('click', loadProc);
+    $('procAuto').addEventListener('change', (ev) => {
+      stopProcAuto();
+      if (ev.target.checked) {
+        loadProc();
+        state.procTimer = setInterval(loadProc, 3000);
+      }
+    });
+    document.querySelectorAll('[data-pview]').forEach((b) => {
+      b.addEventListener('click', () => {
+        state.procView = b.dataset.pview;
+        document.querySelectorAll('[data-pview]').forEach((x) => x.classList.toggle('active', x === b));
+        renderProc();
+      });
+    });
+    $('procSearch').addEventListener('input', () => {
+      if (state.current) renderProc();
+      $('procAll').checked = false;
+    });
+    $('procAll').addEventListener('change', (ev) => {
+      const on = ev.target.checked;
+      document.querySelectorAll('.proc-cb').forEach((cb) => {
+        cb.checked = on;
+        if (on) state.procSel.add(cb.value); else state.procSel.delete(cb.value);
+      });
+      renderProc();
+      updateProcKillBtn();
+    });
+    $('procKill').addEventListener('click', killProc);
+    updateProcKillBtn();
+    $('fsUp').addEventListener('click', () => {
+      const p = state.fsPath;
+      if (!p || p === '/') return;
+      const clean = p.replace(/\/+$/, '');
+      const i = clean.lastIndexOf('/');
+      const up = i <= 0 ? (i === 0 ? '/' : '.') : clean.slice(0, i);
+      loadFs(up);
+    });
+    $('fsPath').addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        navigateFs($('fsPath').value);
+      }
+    });
+    $('fsNew').addEventListener('click', newFsFile);
+    $('fsUpload').addEventListener('click', () => $('fsFileInput').click());
+    $('fsFileInput').addEventListener('change', (ev) => {
+      uploadFs(ev.target.files[0]);
+      ev.target.value = '';
+    });
+    $('fsSave').addEventListener('click', saveFsFile);
+    $('fsEditClose').addEventListener('click', () => $('fsEditor').classList.add('hidden'));
+    $('fsContent').addEventListener('input', syncFsGutter);
+    $('fsContent').addEventListener('scroll', () => {
+      $('fsGutter').scrollTop = $('fsContent').scrollTop;
     });
   }
 

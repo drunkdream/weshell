@@ -24,9 +24,19 @@ type Target struct {
 	ShellType  string    `json:"shellType"`
 	Param      string    `json:"param"`
 	Method     string    `json:"method"`
+	Proxy      string    `json:"proxy,omitempty"` // 可选，访问该靶机的 HTTP 代理
 	CreatedAt  time.Time `json:"createdAt"`
 	LastUsedAt time.Time `json:"lastUsedAt,omitempty"`
 	Note       string    `json:"note"`
+	// Verified 表示是否已通过「测试连接」验证 shell 可达且能正常回显。
+	// 保存靶标时不强制探测，因此新增与改 URL 后默认为 false，需用户主动测试。
+	Verified bool `json:"verified,omitempty"`
+}
+
+// GlobalSettings 是服务级全局设置，对所有靶标生效。
+type GlobalSettings struct {
+	// UserAgent 自定义请求 UA：空串=默认标识，"random"=每次随机，其余视作固定 UA。
+	UserAgent string `json:"userAgent"`
 }
 
 // CommandRecord 是一次命令执行的审计记录。
@@ -41,8 +51,9 @@ type CommandRecord struct {
 }
 
 type document struct {
-	Targets []Target        `json:"targets"`
-	History []CommandRecord `json:"history"`
+	Targets  []Target        `json:"targets"`
+	History  []CommandRecord `json:"history"`
+	Settings GlobalSettings  `json:"settings"`
 }
 
 const (
@@ -101,6 +112,21 @@ func (s *Store) List() []Target {
 	out := make([]Target, len(s.doc.Targets))
 	copy(out, s.doc.Targets)
 	return out
+}
+
+// GetSettings 返回当前全局设置副本。
+func (s *Store) GetSettings() GlobalSettings {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.doc.Settings
+}
+
+// SetSettings 整体替换全局设置并落盘。
+func (s *Store) SetSettings(g GlobalSettings) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.doc.Settings = g
+	return s.saveLocked()
 }
 
 // Add 新增靶标，ID 由服务端生成。

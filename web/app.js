@@ -106,6 +106,10 @@
     abort: null,
     // 文件管理当前所在目录
     fsPath: '.',
+    // 访问过的目录历史（最新在前，用于输入框下拉提示）
+    fsHistory: [],
+    // 文件编辑器是否开启自动换行（软换行时行号无法对齐，会隐藏行号栏）
+    fsWrap: true,
     // 系统监控自动刷新定时器
     sysTimer: null,
     // 进程管理：自动刷新定时器 / 当前视图 / 最近一次原始数据
@@ -114,9 +118,46 @@
     procRaw: [],
     // 当前勾选的进程 PID 集合（用于「结束进程」批量操作）
     procSel: new Set(),
+    // 监听端口：自动刷新定时器 / 最近一次原始数据
+    portsTimer: null,
+    portsRaw: [],
+    // PHP 环境能力研判：自动刷新定时器
+    phpinfoTimer: null,
   };
 
   // ---------- 列表渲染 ----------
+
+  // 操作系统图标（内联 SVG，跟随 currentColor）。
+  const OS_ICON = {
+    windows: '<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M3 5.6l8-1.1v7H3zM12.4 4.4L21 3v8.5h-8.6zM3 12.5h8v7l-8-1.1zM12.4 12.5H21V21l-8.6-1.4z"/></svg>',
+    // Tux 企鹅：橘色脚/嘴 + 两侧鳍 + 浅色肚皮，避免被看成两个圆叠加的雪人
+    linux: '<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">'
+      + '<path d="M6.9 19.2c-1.7.7-2.8 1.8-3.2 2.5 1.5.5 2.9.2 3.9-.4.7-.4 1.2-1 1.5-1.6z" fill="#f2a33c"/>'
+      + '<path d="M17.1 19.2c1.7.7 2.8 1.8 3.2 2.5-1.5.5-2.9.2-3.9-.4-.7-.4-1.2-1-1.5-1.6z" fill="#f2a33c"/>'
+      + '<ellipse cx="6.4" cy="13.6" rx="1.6" ry="3.1" fill="currentColor"/>'
+      + '<ellipse cx="17.6" cy="13.6" rx="1.6" ry="3.1" fill="currentColor"/>'
+      + '<ellipse cx="12" cy="13.8" rx="5.7" ry="6.4" fill="currentColor"/>'
+      + '<ellipse cx="12" cy="14.8" rx="3.9" ry="4.7" fill="var(--bg)"/>'
+      + '<circle cx="12" cy="6.6" r="4.7" fill="currentColor"/>'
+      + '<ellipse cx="12" cy="8" rx="3.3" ry="3" fill="var(--bg)"/>'
+      + '<circle cx="10.4" cy="6.2" r="1.05" fill="currentColor"/>'
+      + '<circle cx="13.6" cy="6.2" r="1.05" fill="currentColor"/>'
+      + '<path d="M12 8.1l1.8 1.4-1.8 1.2-1.8-1.2z" fill="#f2a33c"/>'
+      + '</svg>',
+    unknown: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>',
+  };
+
+  // 由引擎类型推断操作系统：ASP/ASP-VBS 依赖 IIS，必为 Windows；
+  // PHP 型多数跑在 Linux，但也可能在 Windows 上，故标注为推断值。
+  function osOfTarget(t) {
+    if (t.shellType === 'asp' || t.shellType === 'asp-vbs') {
+      return { key: 'windows', label: 'Windows（ASP/IIS，由引擎类型推断）' };
+    }
+    if (t.shellType === 'php-eval' || t.shellType === 'php-cmd') {
+      return { key: 'linux', label: 'Linux（由 PHP 引擎推断，实际也可能是 Windows）' };
+    }
+    return { key: 'unknown', label: '未知操作系统' };
+  }
 
   function renderTargets() {
     const list = $('targetList');
@@ -137,6 +178,8 @@
       text.appendChild(el('span', 'tname', t.name));
       text.appendChild(el('span', 'turl', t.url));
 
+      const badge = el('span', 'tbadge ' + (t.verified ? 'verified' : 'unverified'), t.verified ? '已验证' : '未验证');
+
       const btn = el('button', 'btn-test', '测试');
       btn.title = '执行一次探针命令，验证该靶机是否可连通、命令能否正常回显';
       // 阻止冒泡，避免点测试时把列表项也选中了
@@ -145,17 +188,17 @@
         testTarget(t, btn);
       });
 
-      main.append(text, btn);
+      const os = osOfTarget(t);
+      const osIcon = el('span', 'tos-icon');
+      osIcon.innerHTML = OS_ICON[os.key];
+      osIcon.title = os.label;
+
+      main.append(osIcon, text, badge, btn);
       li.appendChild(main);
       li.addEventListener('click', () => selectTarget(t.id));
       list.appendChild(li);
     });
   }
-
-  // PROBE_COMMAND 是连通性探针：命令简短、无副作用、输出固定，
-  // 便于判断"靶机可达 + 命令可执行 + 回显能取到"这一整条链路是否正常。
-  const PROBE_COMMAND = 'echo weshell-ok';
-  const PROBE_EXPECT = 'weshell-ok';
 
   // testTarget 执行一次探针命令，把结果与具体原因显示在列表项下方。
   async function testTarget(target, btn) {
@@ -170,13 +213,12 @@
     let ok = false;
     let detail = '';
     try {
-      const res = await post('targets/' + encodeURIComponent(target.id) + '/exec', { command: PROBE_COMMAND });
-      const output = (res && res.output) || '';
-      if (output.includes(PROBE_EXPECT)) {
+      const res = await post('targets/' + encodeURIComponent(target.id) + '/verify');
+      if (res && res.verified) {
         ok = true;
         detail = '靶机正常响应（' + res.latencyMs + 'ms）';
       } else {
-        detail = explainFailure(res, output, null);
+        detail = explainFailure(res, (res && res.output) || '', null);
       }
     } catch (err) {
       detail = explainFailure(null, '', err);
@@ -187,6 +229,14 @@
     btn.title = detail;
     btn.dataset.busy = '0';
     showTestResult(li, ok, detail);
+
+    // 后端已在 /verify 中持久化验证状态，这里同步本列表项的徽章（不整列重渲染，保留按钮态）
+    target.verified = ok;
+    const badge = li.querySelector('.tbadge');
+    if (badge) {
+      badge.textContent = ok ? '已验证' : '未验证';
+      badge.className = 'tbadge ' + (ok ? 'verified' : 'unverified');
+    }
 
     // 失败时按钮状态保留更久，方便对照下面的原因文字
     setTimeout(() => {
@@ -259,10 +309,11 @@
       target.method,
       type ? type.label : target.shellType,
       '参数 ' + target.param,
+      target.proxy ? '代理 ' + target.proxy : null,
       target.url,
-    ].join(' · ');
+    ].filter(Boolean).join(' · ');
     $('output').textContent = '';
-    showTab('sys');
+    showTab('info');
     state.fsPath = '.';
     $('fsPath').value = '.';
     $('fsList').textContent = '';
@@ -276,6 +327,13 @@
     $('procSearch').value = '';
     state.procSel.clear();
     $('procAll').checked = false;
+    stopPortsAuto();
+    $('portsBody').textContent = '';
+    $('portsUpdated').textContent = '';
+    $('portsSearch').value = '';
+    stopPhpInfoAuto();
+    $('phpinfoBody').textContent = '';
+    $('phpinfoUpdated').textContent = '';
     $('cmdInput').focus();
   }
 
@@ -358,8 +416,9 @@
 
     const head = el('div', 'block-head');
     head.appendChild(el('span', 'cmd', '$ ' + command));
-    if (errorMsg) {
-      head.appendChild(el('span', 'stat err', '失败 · ' + errorMsg));
+    const actualErr = errorMsg || (res && res.error) || '';
+    if (actualErr) {
+      head.appendChild(el('span', 'stat err', '失败 · ' + actualErr));
     } else {
       const parts = ['HTTP ' + res.status, res.latencyMs + ' ms'];
       if (res.truncated) parts.push('回显已截断');
@@ -368,17 +427,18 @@
     }
     box.appendChild(head);
 
-    if (!errorMsg) {
-      const body = el('pre', 'body-text');
-      if (res.output) {
-        body.textContent = res.output;
-      } else {
-        body.classList.add('placeholder');
-        body.textContent = res.error || '（靶机无回显）';
-      }
-      box.appendChild(body);
-      box.appendChild(el('div', 'req', '请求 ' + res.requestUrl + '\n载荷 ' + res.payload));
+    const body = el('pre', 'body-text');
+    if (res && res.output) {
+      body.textContent = res.output;
+    } else if (actualErr) {
+      body.classList.add('placeholder');
+      body.textContent = actualErr;
+    } else {
+      body.classList.add('placeholder');
+      body.textContent = '（靶机无回显）';
     }
+    box.appendChild(body);
+    if (res) box.appendChild(el('div', 'req', '请求 ' + res.requestUrl + '\n载荷 ' + res.payload));
 
     $('output').appendChild(box);
     box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -427,6 +487,7 @@
       f.param.value = target.param || 'pass';
       f.method.value = target.method || 'POST';
       f.note.value = target.note || '';
+      f.proxy.value = target.proxy || '';
     } else {
       f.shellType.value = (state.types[0] && state.types[0].id) || '';
       f.param.value = 'pass';
@@ -440,6 +501,7 @@
   function closeModals() {
     $('modalTarget').classList.add('hidden');
     $('modalHistory').classList.add('hidden');
+    $('modalSettings').classList.add('hidden');
   }
 
   function formBody() {
@@ -451,12 +513,23 @@
       param: f.param.value.trim(),
       method: f.method.value,
       note: f.note.value.trim(),
+      proxy: f.proxy.value.trim(),
     };
   }
 
   async function submitForm(ev) {
     ev.preventDefault();
-    const body = formBody();
+    const form = ev.target;
+    const btn = form.querySelector('button[type="submit"]');
+    if (btn) { btn.disabled = true; btn.dataset.label = btn.textContent; btn.textContent = '保存中…'; }
+    let body;
+    try {
+      body = formBody();
+    } catch (err) {
+      if (btn) { btn.disabled = false; btn.textContent = btn.dataset.label || '保存'; }
+      toast('表单读取失败：' + err.message);
+      return;
+    }
     try {
       if (state.editingID) {
         await put('targets/' + encodeURIComponent(state.editingID), body);
@@ -470,6 +543,8 @@
     } catch (err) {
       if (err.status === UNAUTHORIZED) requireToken();
       toast('保存失败：' + err.message);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = btn.dataset.label || '保存'; }
     }
   }
 
@@ -553,6 +628,35 @@
     box.hidden = false;
   }
 
+  // 打开全局设置弹窗，并拉取当前 UA 设置回填。
+  async function openSettings() {
+    let ua = '';
+    try {
+      const s = await api('settings');
+      if (s && typeof s.userAgent === 'string') ua = s.userAgent;
+    } catch (e) { /* 用默认空值即可 */ }
+    const mode = ua === '' ? 'default' : (ua === 'random' ? 'random' : 'specified');
+    $('uaMode').value = mode;
+    $('uaValue').value = mode === 'specified' ? (ua || navigator.userAgent) : '';
+    $('uaValueWrap').hidden = mode !== 'specified';
+    $('modalSettings').classList.remove('hidden');
+    $('uaMode').focus();
+  }
+
+  // 保存全局设置：把 UI 选择映射回后端约定的 userAgent 取值。
+  async function saveSettings() {
+    const mode = $('uaMode').value;
+    let ua = '';
+    if (mode === 'random') ua = 'random';
+    else if (mode === 'specified') ua = $('uaValue').value.trim();
+    try {
+      await put('settings', { userAgent: ua });
+      $('modalSettings').classList.add('hidden');
+    } catch (e) {
+      alert('保存失败：' + (e && e.message ? e.message : e));
+    }
+  }
+
   // ---------- 文件管理 ----------
 
   // 在终端 / 文件两个标签页间切换；切到文件时若尚未加载则拉取当前目录。
@@ -562,6 +666,9 @@
     $('fsPanel').classList.toggle('hidden', term || name !== 'fs');
     $('sysPanel').classList.toggle('hidden', name !== 'sys');
     $('procPanel').classList.toggle('hidden', name !== 'proc');
+    $('portsPanel').classList.toggle('hidden', name !== 'ports');
+    $('phpinfoPanel').classList.toggle('hidden', name !== 'phpinfo');
+    $('infoPanel').classList.toggle('hidden', name !== 'info');
     document.querySelectorAll('.tab').forEach((b) => {
       b.classList.toggle('active', b.dataset.tab === name);
     });
@@ -573,6 +680,15 @@
     }
     if (name === 'proc' && state.current) {
       loadProc();
+    }
+    if (name === 'ports' && state.current) {
+      loadPorts();
+    }
+    if (name === 'phpinfo' && state.current) {
+      loadPhpInfo();
+    }
+    if (name === 'info' && state.current) {
+      loadInfo();
     }
   }
 
@@ -589,6 +705,62 @@
       body.textContent = '';
       body.appendChild(el('div', 'fs-err', '加载失败：' + err.message));
     }
+  }
+
+  // 读取靶机请求/响应报文：GET /api/targets/{id}/headers
+  async function loadInfo() {
+    if (!state.current) return;
+    const body = $('infoBody');
+    if (!body.childElementCount) body.appendChild(el('div', 'fs-hint', '加载中…'));
+    try {
+      const d = await api('targets/' + encodeURIComponent(state.current.id) + '/headers');
+      renderInfo(d, body);
+      $('infoUpdated').textContent = '更新于 ' + new Date().toLocaleTimeString();
+    } catch (err) {
+      body.textContent = '';
+      body.appendChild(el('div', 'fs-err', '加载失败：' + err.message));
+    }
+  }
+
+  // 把请求头 / 响应头渲染为可复制的键值列表。
+  function renderInfo(d, body) {
+    body.textContent = '';
+    if (!d.ok && !d.requestHeaders && !d.responseHeaders) {
+      body.appendChild(el('div', 'fs-err', '请求失败：' + (d.error || '未知错误')));
+      return;
+    }
+
+    const head = el('div', 'info-summary');
+    head.appendChild(el('span', 'info-kv', 'URL: ' + (d.requestUrl || '—')));
+    head.appendChild(el('span', 'info-kv', 'HTTP ' + (d.status || 0)));
+    head.appendChild(el('span', 'info-kv', '耗时 ' + (d.latencyMs || 0) + ' ms'));
+    if (d.error) head.appendChild(el('span', 'info-kv err', '错误: ' + d.error));
+    body.appendChild(head);
+
+    if (d.requestHeaders) {
+      body.appendChild(headerTable('请求头（管理端发出）', d.requestHeaders));
+    }
+    if (d.responseHeaders) {
+      body.appendChild(headerTable('响应头（靶机返回）', d.responseHeaders));
+    }
+  }
+
+  // 把 http.Header 渲染成两列表格：键 + 多值（逗号拼接）。
+  function headerTable(title, headers) {
+    const block = el('div', 'info-block');
+    block.appendChild(el('h4', 'info-title', title));
+    const table = el('div', 'info-table');
+    Object.keys(headers).sort().forEach((k) => {
+      const row = el('div', 'info-row');
+      row.appendChild(el('div', 'info-key', k));
+      row.appendChild(el('div', 'info-val', (headers[k] || []).join(', ')));
+      table.appendChild(row);
+    });
+    if (!Object.keys(headers).length) {
+      table.appendChild(el('div', 'info-row', '（空）'));
+    }
+    block.appendChild(table);
+    return block;
   }
 
   function fmtBytes(b) {
@@ -699,6 +871,21 @@
     }
     body.appendChild(diskCard);
 
+    // 网络地址：内网 IP（靶机网卡地址）与公网 IP（出网探测结果）
+    const intIPs = Array.isArray(d.intIPs) ? d.intIPs : [];
+    const pubIP = d.pubIP || '';
+    const netCard = el('div', 'sys-card wide');
+    netCard.appendChild(el('div', 'sys-card-title', '网络地址'));
+    const irow = el('div', 'sys-card-row');
+    irow.appendChild(el('span', 'sys-k', '内网 IP'));
+    irow.appendChild(el('span', 'sys-v', intIPs.length ? intIPs.join(', ') : '—'));
+    netCard.appendChild(irow);
+    const prow = el('div', 'sys-card-row');
+    prow.appendChild(el('span', 'sys-k', '公网 IP'));
+    prow.appendChild(el('span', 'sys-v', pubIP ? pubIP : '—（靶机无出网或已禁用）'));
+    netCard.appendChild(prow);
+    body.appendChild(netCard);
+
   }
 
   // ---------- 进程管理（独立页） ----------
@@ -805,7 +992,9 @@
       row.appendChild(el('span', 'mono proc-pid', String(node.pid)));
       row.appendChild(el('span', 'mono proc-user', node.user));
       row.appendChild(el('span', 'mono proc-cpu', (Number(node.cpu) || 0).toFixed(1) + '%'));
-      row.appendChild(el('span', 'proc-cmd', node.cmd));
+      const cmdSpan = el('span', 'proc-cmd', node.cmd);
+      cmdSpan.title = node.cmd;
+      row.appendChild(cmdSpan);
       if (node._self) row.classList.add('proc-hit');
       li.appendChild(row);
       if (hasKids) {
@@ -859,10 +1048,12 @@
       tr.appendChild(el('td', 'mono', String(p.user)));
       tr.appendChild(el('td', 'mono', (Number(p.cpu) || 0).toFixed(1)));
       tr.appendChild(el('td', 'mono', (Number(p.mem) || 0).toFixed(1)));
-      tr.appendChild(el('td', 'mono', String(p.cmd)));
+      const cmdTd = el('td', 'mono proc-cmd-cell', String(p.cmd));
+      cmdTd.title = String(p.cmd);
+      tr.appendChild(cmdTd);
       tbl.appendChild(tr);
     });
-    const wrap = el('div', 'sys-proc-wrap');
+    const wrap = el('div', 'proc-list-wrap');
     wrap.appendChild(tbl);
     body.appendChild(wrap);
   }
@@ -904,6 +1095,289 @@
     if (cb) cb.checked = false;
   }
 
+  // ---------- 监听端口管理（独立页） ----------
+
+  // 读取靶机监听端口：GET /api/targets/{id}/ports
+  async function loadPorts() {
+    if (!state.current) return;
+    const body = $('portsBody');
+    if (!body.childElementCount) body.appendChild(el('div', 'fs-hint', '加载中…'));
+    try {
+      const d = await api('targets/' + encodeURIComponent(state.current.id) + '/ports');
+      state.portsRaw = Array.isArray(d.ports) ? d.ports : [];
+      renderPorts();
+      $('portsUpdated').textContent = '更新于 ' + new Date().toLocaleTimeString();
+    } catch (err) {
+      body.textContent = '';
+      body.appendChild(el('div', 'fs-err', '加载失败：' + err.message));
+    }
+  }
+
+  function stopPortsAuto() {
+    if (state.portsTimer) { clearInterval(state.portsTimer); state.portsTimer = null; }
+    const cb = $('portsAuto');
+    if (cb) cb.checked = false;
+  }
+
+  // 按搜索词过滤并渲染端口表格。
+  function renderPorts() {
+    const body = $('portsBody');
+    body.textContent = '';
+    const ports = state.portsRaw || [];
+    const q = ($('portsSearch').value || '').trim().toLowerCase();
+    const list = q ? ports.filter((p) =>
+      String(p.proto).toLowerCase().includes(q) ||
+      String(p.addr).toLowerCase().includes(q) ||
+      String(p.port).includes(q) ||
+      String(p.comm).toLowerCase().includes(q) ||
+      String(p.pid).includes(q)) : ports;
+    if (!ports.length) {
+      body.appendChild(el('div', 'fs-hint', '（无数据，靶机可能未开放任何监听端口，或禁用了 /proc 读取）'));
+      return;
+    }
+    if (!list.length) {
+      body.appendChild(el('div', 'fs-hint', '（无匹配项）'));
+      return;
+    }
+    // 按地址族、端口号排序，端口号小的在前，便于对照
+    const sorted = list.slice().sort((a, b) => (Number(a.port) || 0) - (Number(b.port) || 0));
+    const tbl = el('table', 'sys-proc');
+    const thead = el('tr', '');
+    ['协议', '本地地址', '端口', '进程', 'PID', 'inode'].forEach((h) => thead.appendChild(el('th', '', h)));
+    tbl.appendChild(thead);
+    sorted.forEach((p) => {
+      const tr = el('tr', '');
+      tr.appendChild(el('td', 'mono', String(p.proto || '—')));
+      tr.appendChild(el('td', 'mono', String(p.addr || '—')));
+      tr.appendChild(el('td', 'mono', String(p.port || '—')));
+      tr.appendChild(el('td', 'mono', String(p.comm || '—')));
+      tr.appendChild(el('td', 'mono', String(p.pid || '—')));
+      tr.appendChild(el('td', 'mono', String(p.inode || '—')));
+      tbl.appendChild(tr);
+    });
+    const wrap = el('div', 'sys-proc-wrap');
+    wrap.appendChild(tbl);
+    body.appendChild(wrap);
+  }
+
+  // ---------- 端口扫描（在靶机上对目标主机发起 TCP 探测） ----------
+
+  // ---- 端口/主机展开与分批（前端分批，保证每次请求 ≤30s）----
+  const SCAN_PORT_BATCH = 5;   // 每请求携带的端口数；ASP/PHP 每端口最坏 2s → 5×2=10s ≤30s
+  const SCAN_HOSTS_MAX = 512;   // 与后端 ExpandHosts 上限一致
+  const SCAN_PORTS_MAX = 5000;  // 与后端 ExpandPorts 上限一致
+  const SCAN_REQ_TIMEOUT = 60000; // 单批请求的护栏超时（实际靶机脚本 ≤24s，这里留足余量）
+
+  function expandPorts(spec) {
+    const out = [];
+    for (let part of String(spec).split(',')) {
+      part = part.trim();
+      if (!part) continue;
+      if (part.includes('-')) {
+        const [a, b] = part.split('-').map((x) => parseInt(x, 10));
+        if (!Number.isFinite(a) || !Number.isFinite(b) || a < 0 || b > 65535 || a > b) throw new Error('端口范围非法：' + part);
+        if (b - a + 1 > 2000) throw new Error('单段端口范围不能超过 2000（' + part + '）');
+        for (let p = a; p <= b; p++) out.push(p);
+      } else {
+        const p = parseInt(part, 10);
+        if (!Number.isFinite(p) || p < 0 || p > 65535) throw new Error('端口非法：' + part);
+        out.push(p);
+      }
+      if (out.length > SCAN_PORTS_MAX) throw new Error('端口总数不能超过 ' + SCAN_PORTS_MAX);
+    }
+    return out;
+  }
+
+  function ipToInt(ip) {
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+    if (!m) return null;
+    const nums = [m[1], m[2], m[3], m[4]].map(Number);
+    if (nums.some((n) => n > 255)) return null;
+    return (((nums[0] * 256 + nums[1]) * 256 + nums[2]) * 256 + nums[3]) >>> 0;
+  }
+  function intToIp(n) {
+    return [(n >>> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255].join('.');
+  }
+  function expandHosts(spec) {
+    const out = [];
+    const seen = new Set();
+    const add = (h) => { if (!seen.has(h)) { seen.add(h); out.push(h); } };
+    for (let part of String(spec).split(',')) {
+      part = part.trim();
+      if (!part) continue;
+      if (part.includes('/')) {
+        const [base, bits] = part.split('/');
+        const n = ipToInt(base);
+        const b = parseInt(bits, 10);
+        if (n === null || !Number.isFinite(b) || b < 0 || b > 32) throw new Error('CIDR 非法：' + part);
+        const size = Math.pow(2, 32 - b);
+        if (size > SCAN_HOSTS_MAX) throw new Error('CIDR 主机数超过 ' + SCAN_HOSTS_MAX + '（' + part + '）');
+        const start = Math.floor(n / size) * size;
+        for (let i = 0; i < size; i++) add(intToIp((start + i) >>> 0));
+      } else if (part.includes('-')) {
+        const [a, b] = part.split('-').map((x) => x.trim());
+        const na = ipToInt(a), nb = ipToInt(b);
+        if (na === null || nb === null) throw new Error('IP 区间非法：' + part);
+        if (na > nb) throw new Error('IP 区间起点大于终点：' + part);
+        if (nb - na + 1 > SCAN_HOSTS_MAX) throw new Error('IP 区间主机数超过 ' + SCAN_HOSTS_MAX);
+        for (let i = na; i <= nb; i++) add(intToIp(i >>> 0));
+      } else {
+        if (ipToInt(part) === null && !/^[a-zA-Z0-9.-]+$/.test(part)) throw new Error('主机非法：' + part);
+        add(part);
+      }
+      if (out.length > SCAN_HOSTS_MAX) throw new Error('主机总数不能超过 ' + SCAN_HOSTS_MAX);
+    }
+    return out;
+  }
+
+  function chunkArray(arr, n) {
+    const out = [];
+    for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+    return out;
+  }
+
+  // 将分批结果汇总成 renderScan 兼容的结构（单主机 {ports:[{port,open}]} / 多主机 {hosts:[{host,alive,ports}]}）。
+  function buildScanView(recs, hosts, portList) {
+    if (hosts.length === 1) {
+      const rec = recs.get(hosts[0]);
+      const ports = [...rec.ports.entries()].map(([port, open]) => ({ port, open }))
+        .sort((a, b) => a.port - b.port);
+      return { ports };
+    }
+    const hostViews = hosts.map((h) => {
+      const rec = recs.get(h);
+      const ports = [...rec.ports.entries()].filter(([, o]) => o).map(([p]) => p).sort((a, b) => a - b);
+      return { host: h, alive: rec.alive, ports };
+    });
+    return { hosts: hostViews };
+  }
+
+  // 对目标主机做 TCP 端口扫描：GET /api/targets/{id}/scan?host=&ports=
+  // 前端按「1 主机 × ≤12 端口」分批，每请求对应靶机一次 ≤24s 的脚本，保证每次请求 ≤30s 并展示进度。
+  async function loadScan() {
+    if (!state.current) return;
+    const hostSpec = $('scanHost').value.trim();
+    const portsSpec = $('scanPorts').value.trim();
+    const status = $('scanStatus');
+    const body = $('scanBody');
+    if (!hostSpec) {
+      status.textContent = '请填写目标主机';
+      status.className = 'scan-status err';
+      return;
+    }
+    if (!portsSpec) {
+      status.textContent = '请填写端口';
+      status.className = 'scan-status err';
+      return;
+    }
+    let hosts, portList;
+    try {
+      hosts = expandHosts(hostSpec);
+      portList = expandPorts(portsSpec);
+    } catch (e) {
+      status.textContent = '参数错误：' + e.message;
+      status.className = 'scan-status err';
+      return;
+    }
+    if (!hosts.length || !portList.length) {
+      status.textContent = '目标或端口为空';
+      status.className = 'scan-status err';
+      return;
+    }
+    status.textContent = '扫描中…';
+    status.className = 'scan-status';
+    body.textContent = '';
+    try {
+      const portBatches = chunkArray(portList, SCAN_PORT_BATCH);
+      const total = hosts.length * portBatches.length;
+      let done = 0;
+      let elapsedSum = 0;
+      const recs = new Map();
+      for (const h of hosts) recs.set(h, { ports: new Map(), alive: false });
+      for (const h of hosts) {
+        for (const pb of portBatches) {
+          const q = '?host=' + encodeURIComponent(h) + '&ports=' + encodeURIComponent(pb.join(','));
+          const d = await api('targets/' + encodeURIComponent(state.current.id) + '/scan' + q, { timeoutMs: SCAN_REQ_TIMEOUT });
+          const ps = (d && Array.isArray(d.ports)) ? d.ports : [];
+          const rec = recs.get(h);
+          for (const p of ps) {
+            const port = Number(p.port);
+            rec.ports.set(port, !!p.open);
+            if (p.open) rec.alive = true;
+          }
+          if (typeof d.elapsed === 'number') elapsedSum += d.elapsed;
+          done++;
+          status.textContent = '扫描中… ' + done + '/' + total + (hosts.length > 1 ? '（' + h + '）' : '');
+          if (hosts.length > 1) renderScan(buildScanView(recs, hosts, portList), null);
+        }
+      }
+      renderScan(buildScanView(recs, hosts, portList), hosts.length === 1 ? hostSpec : null);
+      const openTotal = [...recs.values()].reduce((s, r) => s + [...r.ports.values()].filter(Boolean).length, 0);
+      const aliveCount = [...recs.values()].filter((r) => r.alive).length;
+      const elapsed = elapsedSum > 0 ? elapsedSum.toFixed(2) + 's' : '—';
+      status.textContent = '扫描完成：' + (hosts.length > 1
+        ? ('共 ' + hosts.length + ' 个目标，在线 ' + aliveCount + ' 个，开放端口 ' + openTotal + ' 个')
+        : ('共 ' + portList.length + ' 个端口，开放 ' + openTotal + ' 个')) + '，用时 ' + elapsed;
+      status.className = 'scan-status ok';
+    } catch (err) {
+      status.textContent = '扫描失败：' + err.message;
+      status.className = 'scan-status err';
+    }
+  }
+
+  // 渲染端口扫描结果到 #scanBody。兼容单主机（{host,ports}）与多主机（{hosts:[...]}）两种结构。
+  function renderScan(d, host) {
+    const body = $('scanBody');
+    body.textContent = '';
+    if (Array.isArray(d.hosts)) {
+      if (!d.hosts.length) {
+        body.appendChild(el('div', 'fs-hint', '（无数据）'));
+        return;
+      }
+      const sorted = d.hosts.slice().sort((a, b) => (a.alive === b.alive) ? 0 : (a.alive ? -1 : 1));
+      const tbl = el('table', 'sys-proc');
+      const thead = el('tr', '');
+      ['主机', '状态', '开放端口'].forEach((h) => thead.appendChild(el('th', '', h)));
+      tbl.appendChild(thead);
+      sorted.forEach((x) => {
+        const ps = Array.isArray(x.ports) ? x.ports : [];
+        const tr = el('tr', x.alive ? 'open-row' : '');
+        tr.appendChild(el('td', 'mono', String(x.host || '-')));
+        tr.appendChild(el('td', 'mono', x.alive ? '在线' : '离线'));
+        tr.appendChild(el('td', 'mono', x.alive ? (ps.length ? ps.join(', ') : '（无开放端口）') : '—'));
+        tbl.appendChild(tr);
+      });
+      const wrap = el('div', 'sys-proc-wrap');
+      wrap.appendChild(tbl);
+      body.appendChild(wrap);
+      return;
+    }
+    // 单主机结果（旧结构）
+    const ports = Array.isArray(d.ports) ? d.ports : [];
+    if (!ports.length) {
+      body.appendChild(el('div', 'fs-hint', '（无数据）'));
+      return;
+    }
+    const open = ports.filter((p) => p.open);
+    const sorted = ports.slice().sort((a, b) => (Number(a.port) || 0) - (Number(b.port) || 0));
+    const tbl = el('table', 'sys-proc');
+    const thead = el('tr', '');
+    ['端口', '状态', '主机'].forEach((h) => thead.appendChild(el('th', '', h)));
+    tbl.appendChild(thead);
+    sorted.forEach((p) => {
+      const tr = el('tr', p.open ? 'open-row' : '');
+      tr.appendChild(el('td', 'mono', String(p.port)));
+      tr.appendChild(el('td', 'mono', p.open ? '开放' : '关闭'));
+      tr.appendChild(el('td', 'mono', String(host || '—')));
+      tbl.appendChild(tr);
+    });
+    const wrap = el('div', 'sys-proc-wrap');
+    wrap.appendChild(tbl);
+    body.appendChild(wrap);
+    const sum = el('div', 'fs-hint', '开放 ' + open.length + ' / ' + ports.length + ' 个端口' + (open.length ? '：' + open.map((p) => p.port).join(', ') : ''));
+    body.appendChild(sum);
+  }
+
   // UTF-8 字符串 <-> base64（靶机以 base64 回传文件内容，避免二进制/特殊字符破坏回显截取）。
   function b64encodeUtf8(str) {
     const bytes = new TextEncoder().encode(str);
@@ -941,17 +1415,29 @@
   }
 
   // 从输入框跳转到目录：相对路径基于当前目录解析为绝对路径再请求
+  // 解析用户在路径框里输入的目录并跳转：
+  //   - Windows 绝对路径（如 C:\foo 或 C:/foo、UNC \\host\share）直接作为目标，不再与当前目录拼接；
+  //   - 以 / 开头的类 Unix 绝对路径直接作为目标；
+  //   - 其余按相对路径，基于当前目录拼接（分隔符沿用当前目录的风格）。
   function navigateFs(raw) {
     let dir = (raw || '').trim();
     if (!dir) {
       loadFs(state.fsPath);
       return;
     }
-    if (dir !== '/' && !dir.startsWith('/')) {
-      const base = state.fsPath === '.' ? '' : state.fsPath.replace(/\/+$/, '');
-      dir = base ? base + '/' + dir : dir;
+    if (/^[A-Za-z]:[\\/]/.test(dir) || dir.startsWith('\\\\') || dir.startsWith('/')) {
+      loadFs(dir);
+      return;
     }
-    loadFs(dir);
+    let base = state.fsPath;
+    if (!base || base === '.') base = '';
+    else base = base.replace(/[\\/]+$/, '');
+    if (!base) {
+      loadFs(dir);
+      return;
+    }
+    const sep = base.includes('\\') ? '\\' : '/';
+    loadFs(base + sep + dir);
   }
 
   // 列出目录：GET /api/targets/{id}/fs/list?path=
@@ -967,10 +1453,16 @@
       const cur = data.path || dir;
       state.fsPath = cur;
       $('fsPath').value = cur;
+      // 记录访问历史（去重、最新在前、最多保留 30 条）。
+      if (cur) {
+        state.fsHistory = [cur, ...state.fsHistory.filter((x) => x !== cur)].slice(0, 30);
+      }
       list.textContent = '';
       if (!data.entries.length) {
         list.appendChild(el('li', 'fs-row fs-hint', '（空目录）'));
       }
+      // 先展示子目录，再展示文件；同类按名称排序。
+      data.entries.sort((a, b) => (Number(b.isDir) - Number(a.isDir)) || String(a.name).localeCompare(String(b.name)));
       data.entries.forEach((e) => {
         const li = el('li', 'fs-row' + (e.isDir ? ' is-dir' : ''));
         li.appendChild(el('span', 'fs-name', e.name + (e.isDir ? '/' : '')));
@@ -1000,15 +1492,58 @@
     }
   }
 
+  // 隐形镜像元素：用与 textarea 相同的字体/宽度，测量某行软换行后占几行。
+  let fsMirror = null;
+  function fsMirrorEl(ta) {
+    if (!fsMirror) {
+      fsMirror = document.createElement('div');
+      fsMirror.style.position = 'absolute';
+      fsMirror.style.left = '-9999px';
+      fsMirror.style.top = '0';
+      fsMirror.style.visibility = 'hidden';
+      document.body.appendChild(fsMirror);
+    }
+    const cs = getComputedStyle(ta);
+    fsMirror.style.fontFamily = cs.fontFamily;
+    fsMirror.style.fontSize = cs.fontSize;
+    fsMirror.style.lineHeight = cs.lineHeight;
+    fsMirror.style.whiteSpace = 'pre-wrap';
+    fsMirror.style.overflowWrap = 'anywhere';
+    fsMirror.style.width = Math.max(1, ta.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight)) + 'px';
+    return fsMirror;
+  }
+
   // 根据编辑器内容重算左侧行号，并同步滚动位置（与 textarea 逐行对齐）。
+  // 开启自动换行时，一个逻辑行可能占多显示行，行号需要按实际行数排版才能对齐。
   function syncFsGutter() {
     const ta = $('fsContent');
     const gut = $('fsGutter');
-    const n = ta.value.split('\n').length;
+    const lines = ta.value.split('\n');
     let s = '';
-    for (let i = 1; i <= n; i++) s += i + '\n';
+    if (state.fsWrap && lines.length <= 2000) {
+      const m = fsMirrorEl(ta);
+      const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
+      for (let i = 0; i < lines.length; i++) {
+        m.textContent = lines[i] || ' ';
+        const rows = Math.max(1, Math.round(m.offsetHeight / lh));
+        s += (i + 1) + '\n';
+        for (let r = 1; r < rows; r++) s += '\n';
+      }
+    } else {
+      for (let i = 1; i <= lines.length; i++) s += i + '\n';
+    }
     gut.textContent = s;
     gut.scrollTop = ta.scrollTop;
+  }
+
+  // 应用自动换行设置：开启时软换行并隐藏行号栏，关闭时恢复逐行显示与行号。
+  function applyFsWrap() {
+    const ed = $('fsEditor');
+    ed.classList.toggle('wrap', state.fsWrap);
+    const btn = $('fsWrap');
+    btn.classList.toggle('primary', state.fsWrap);
+    btn.classList.toggle('ghost', !state.fsWrap);
+    syncFsGutter();
   }
 
   // 读取文件到编辑器：GET /api/targets/{id}/fs/read?path=
@@ -1018,11 +1553,18 @@
       $('fsEditName').textContent = name + '  (' + f.size + ' B)';
       $('fsContent').value = b64decodeUtf8(f.base64);
       $('fsEditor').dataset.path = path;
+      $('fsEditorBackdrop').classList.remove('hidden');
       $('fsEditor').classList.remove('hidden');
-      syncFsGutter();
+      applyFsWrap();
     } catch (err) {
       toast('读取失败：' + err.message);
     }
+  }
+
+  // 关闭文件编辑/查看弹窗。
+  function closeFsEditor() {
+    $('fsEditor').classList.add('hidden');
+    $('fsEditorBackdrop').classList.add('hidden');
   }
 
   // 保存编辑器内容：POST /api/targets/{id}/fs/write
@@ -1035,7 +1577,7 @@
         base64: b64encodeUtf8($('fsContent').value),
       });
       toast('已保存 ' + path);
-      $('fsEditor').classList.add('hidden');
+      closeFsEditor();
       loadFs(state.fsPath);
     } catch (err) {
       toast('保存失败：' + err.message);
@@ -1084,13 +1626,205 @@
     $('fsEditName').textContent = name + '  (新建)';
     $('fsContent').value = '';
     $('fsEditor').dataset.path = path;
+    $('fsEditorBackdrop').classList.remove('hidden');
     $('fsEditor').classList.remove('hidden');
-    syncFsGutter();
+    applyFsWrap();
+  }
+
+  // ---------- PHP 环境能力研判（独立页） ----------
+
+  // 读取靶机 phpinfo 能力研判：GET /api/targets/{id}/phpinfo
+  async function loadPhpInfo() {
+    if (!state.current) return;
+    const body = $('phpinfoBody');
+    if (!body.childElementCount) body.appendChild(el('div', 'fs-hint', '加载中…'));
+    try {
+      const d = await api('targets/' + encodeURIComponent(state.current.id) + '/phpinfo');
+      renderPhpInfo(d, body);
+      $('phpinfoUpdated').textContent = '更新于 ' + new Date().toLocaleTimeString();
+    } catch (err) {
+      body.textContent = '';
+      body.appendChild(el('div', 'fs-err', '加载失败：' + err.message));
+    }
+  }
+
+  function stopPhpInfoAuto() {
+    if (state.phpinfoTimer) { clearInterval(state.phpinfoTimer); state.phpinfoTimer = null; }
+    const cb = $('phpinfoAuto');
+    if (cb) cb.checked = false;
+  }
+
+  // 把 ini 值归一为布尔（'1'/'On'/'true' 为真，其余为假，空串视为未设置）。
+  function iniBool(v) {
+    return v === '1' || v === 'On' || v === 'on' || v === 'true' || v === 'yes';
+  }
+
+  function badge(kind, text) {
+    return el('span', 'ph-badge ' + kind, text);
+  }
+
+  // 渲染 phpinfo 能力研判：先给结论横幅，再列配置项与禁用函数。
+  function renderPhpInfo(d, body) {
+    body.textContent = '';
+    // ASP 靶机返回 kind:"asp"，走独立渲染；其余按 PHP 环境渲染。
+    if (d.kind === 'asp') { renderAspEnv(d, body); return; }
+
+    const anyExec = !!d.anyExec;
+    const exec = d.execFunctions || {};
+
+    // 结论横幅
+    const banner = el('div', 'ph-banner ' + (anyExec ? 'ok' : 'err'));
+    if (anyExec) {
+      const enabled = Object.keys(exec).filter((k) => exec[k]);
+      banner.appendChild(el('div', 'ph-banner-title', '✓ 可执行系统命令'));
+      banner.appendChild(el('div', 'ph-banner-sub', '可用函数：' + enabled.join('、')));
+    } else {
+      banner.appendChild(el('div', 'ph-banner-title', '✗ 命令执行函数均被禁用'));
+      banner.appendChild(el('div', 'ph-banner-sub', 'exec/system/passthru/shell_exec/popen/proc_open/pcntl_exec 全部不可用，只能做纯 PHP 逻辑或文件类操作'));
+    }
+    body.appendChild(banner);
+
+    // 基本信息卡片
+    const info = el('div', 'sys-cards');
+    const basic = [
+      ['PHP 版本', d.version || '—'],
+      ['SAPI', d.sapi || '—'],
+      ['操作系统', d.os || '—'],
+      ['运行用户', d.user || '—'],
+      ['Web 服务', d.serverSoftware || '—'],
+      ['DOCUMENT_ROOT', d.docRoot || '—'],
+    ];
+    basic.forEach(([k, v]) => {
+      const c = el('div', 'sys-card');
+      c.appendChild(el('div', 'sys-card-title', k));
+      c.appendChild(el('div', 'sys-card-val', String(v)));
+      info.appendChild(c);
+    });
+    body.appendChild(info);
+
+    // 命令执行函数逐一看板
+    const fnCard = el('div', 'sys-card wide');
+    fnCard.appendChild(el('div', 'sys-card-title', '命令执行函数可用性'));
+    const fnRow = el('div', 'ph-fn-row');
+    Object.keys(exec).forEach((k) => {
+      const b = el('span', 'ph-fn ' + (exec[k] ? 'avail' : 'blocked'), k + (exec[k] ? ' ✓' : ' ✗'));
+      fnRow.appendChild(b);
+    });
+    fnCard.appendChild(fnRow);
+    body.appendChild(fnCard);
+
+    // 受限配置项
+    const cfgCard = el('div', 'sys-card wide');
+    cfgCard.appendChild(el('div', 'sys-card-title', '受限 / 安全相关配置'));
+    const rows = [
+      ['disable_functions', (Array.isArray(d.disabledFunctions) ? d.disabledFunctions.join(', ') : '') || '（无）', d.disabledFunctions && d.disabledFunctions.length ? 'warn' : 'ok'],
+      ['open_basedir', d.openBasedir || '（未限制）', d.openBasedir ? 'warn' : 'ok'],
+      ['allow_url_include', d.allowUrlInclude, iniBool(d.allowUrlInclude) ? 'warn' : 'ok'],
+      ['allow_url_fopen', d.allowUrlFopen, iniBool(d.allowUrlFopen) ? 'ok' : 'warn'],
+      ['safe_mode', d.safeMode || '（无）', d.safeMode ? 'warn' : 'ok'],
+      ['display_errors', d.displayErrors, iniBool(d.displayErrors) ? 'ok' : 'warn'],
+      ['file_uploads', d.fileUploads, iniBool(d.fileUploads) ? 'ok' : 'warn'],
+      ['upload_tmp_dir', d.uploadTmpDir || '（默认）', 'ok'],
+    ];
+    rows.forEach(([k, v, kind]) => {
+      const r = el('div', 'sys-card-row');
+      r.appendChild(el('span', 'sys-k', k));
+      const right = el('span', 'sys-v');
+      right.appendChild(badge(kind, kind === 'warn' ? '受限' : '正常'));
+      right.appendChild(el('span', 'ph-cfg-val', ' ' + String(v)));
+      r.appendChild(right);
+      cfgCard.appendChild(r);
+    });
+    body.appendChild(cfgCard);
+
+    // 禁用函数清单（缺失的能力）
+    const df = Array.isArray(d.disabledFunctions) ? d.disabledFunctions : [];
+    const dfCard = el('div', 'sys-card wide');
+    dfCard.appendChild(el('div', 'sys-card-title', '被禁用的函数（共 ' + df.length + ' 个）'));
+    if (!df.length) {
+      dfCard.appendChild(el('div', 'fs-hint', '（disable_functions 为空，未禁用任何函数）'));
+    } else {
+      const wrap = el('div', 'ph-tag-wrap');
+      df.forEach((fn) => wrap.appendChild(el('span', 'ph-tag', fn)));
+      dfCard.appendChild(wrap);
+    }
+    body.appendChild(dfCard);
+
+    // 已加载扩展
+    const ext = Array.isArray(d.extensions) ? d.extensions : [];
+    const extCard = el('div', 'sys-card wide');
+    extCard.appendChild(el('div', 'sys-card-title', '已加载扩展（共 ' + ext.length + ' 个）'));
+    const ewrap = el('div', 'ph-tag-wrap');
+    ext.forEach((x) => ewrap.appendChild(el('span', 'ph-tag', x)));
+    extCard.appendChild(ewrap);
+    body.appendChild(extCard);
+  }
+
+  // 渲染 ASP 环境能力研判：结论横幅（能否跑命令）+ 基本信息 + COM 组件可用性看板。
+  function renderAspEnv(d, body) {
+    const anyExec = !!d.anyExec;
+    const comps = d.execComponents || {};
+
+    // 结论横幅
+    const banner = el('div', 'ph-banner ' + (anyExec ? 'ok' : 'err'));
+    if (anyExec) {
+      banner.appendChild(el('div', 'ph-banner-title', '✓ 可执行系统命令（WScript.Shell 可用）'));
+      banner.appendChild(el('div', 'ph-banner-sub', '可通过 cmd /c 执行命令；文件读写依赖 Scripting.FileSystemObject'));
+    } else {
+      banner.appendChild(el('div', 'ph-banner-title', '✗ 关键 COM 组件不可用'));
+      banner.appendChild(el('div', 'ph-banner-sub', 'WScript.Shell 被禁用/缺失，无法稳定执行命令，仅能做受限的纯脚本逻辑'));
+    }
+    body.appendChild(banner);
+
+    // 基本信息卡片
+    const info = el('div', 'sys-cards');
+    const basic = [
+      ['脚本引擎', d.engine || '—'],
+      ['操作系统', d.os || '—'],
+      ['Web 服务', d.serverSoftware || '—'],
+      ['物理路径', d.docRoot || '—'],
+    ];
+    basic.forEach(([k, v]) => {
+      const c = el('div', 'sys-card');
+      c.appendChild(el('div', 'sys-card-title', k));
+      c.appendChild(el('div', 'sys-card-val', String(v)));
+      info.appendChild(c);
+    });
+    body.appendChild(info);
+
+    // COM 组件可用性看板
+    const fnCard = el('div', 'sys-card wide');
+    fnCard.appendChild(el('div', 'sys-card-title', '关键 COM 组件可用性'));
+    const fnRow = el('div', 'ph-fn-row');
+    Object.keys(comps).forEach((k) => {
+      const b = el('span', 'ph-fn ' + (comps[k] ? 'avail' : 'blocked'), k + (comps[k] ? ' ✓' : ' ✗'));
+      fnRow.appendChild(b);
+    });
+    fnCard.appendChild(fnRow);
+    body.appendChild(fnCard);
+
+    // 可用组件清单
+    const list = Array.isArray(d.components) ? d.components : [];
+    const extCard = el('div', 'sys-card wide');
+    extCard.appendChild(el('div', 'sys-card-title', '可用组件（共 ' + list.length + ' 个）'));
+    const ewrap = el('div', 'ph-tag-wrap');
+    list.forEach((x) => ewrap.appendChild(el('span', 'ph-tag', x)));
+    extCard.appendChild(ewrap);
+    body.appendChild(extCard);
   }
 
   // ---------- 事件绑定 ----------
 
   function bind() {
+    $('btnSettings').addEventListener('click', openSettings);
+    $('saveSettings').addEventListener('click', saveSettings);
+    $('uaMode').addEventListener('change', (ev) => {
+      const isSpecified = ev.target.value === 'specified';
+      $('uaValueWrap').hidden = !isSpecified;
+      if (isSpecified && !$('uaValue').value.trim()) {
+        $('uaValue').value = navigator.userAgent;
+      }
+    });
     $('btnNew').addEventListener('click', () => openForm(null));
     $('btnEdit').addEventListener('click', () => {
       if (state.current) openForm(state.current);
@@ -1147,6 +1881,7 @@
         state.sysTimer = setInterval(loadSys, 3000);
       }
     });
+    $('infoRefresh').addEventListener('click', loadInfo);
     $('procRefresh').addEventListener('click', loadProc);
     $('procAuto').addEventListener('change', (ev) => {
       stopProcAuto();
@@ -1177,20 +1912,67 @@
     });
     $('procKill').addEventListener('click', killProc);
     updateProcKillBtn();
+    $('portsRefresh').addEventListener('click', loadPorts);
+    $('portsAuto').addEventListener('change', (ev) => {
+      stopPortsAuto();
+      if (ev.target.checked) {
+        loadPorts();
+        state.portsTimer = setInterval(loadPorts, 3000);
+      }
+    });
+    $('portsSearch').addEventListener('input', () => {
+      if (state.current) renderPorts();
+    });
+    $('scanBtn').addEventListener('click', loadScan);
+    $('scanHost').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') loadScan(); });
+    $('scanPorts').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') loadScan(); });
+    $('phpinfoRefresh').addEventListener('click', loadPhpInfo);
+    $('phpinfoAuto').addEventListener('change', (ev) => {
+      stopPhpInfoAuto();
+      if (ev.target.checked) {
+        loadPhpInfo();
+        state.phpinfoTimer = setInterval(loadPhpInfo, 3000);
+      }
+    });
     $('fsUp').addEventListener('click', () => {
       const p = state.fsPath;
-      if (!p || p === '/') return;
-      const clean = p.replace(/\/+$/, '');
-      const i = clean.lastIndexOf('/');
-      const up = i <= 0 ? (i === 0 ? '/' : '.') : clean.slice(0, i);
-      loadFs(up);
+      // 根目录（/、\、盘符根 C:\）无法再向上。
+      if (!p || p === '/' || p === '\\' || /^[A-Za-z]:[\\/]?$/.test(p)) return;
+      const clean = p.replace(/[\\/]+$/, '');
+      const i = Math.max(clean.lastIndexOf('/'), clean.lastIndexOf('\\'));
+      // i===0 表示类 Unix 顶级目录（如 /etc，父目录为 /）；i<0 表示无分隔符，回退到当前目录。
+      if (i <= 0) { loadFs(i === 0 ? '/' : '.'); return; }
+      // 保留分隔符本身（如 C:\Windows -> C:\），否则会丢掉成 C: 这种非法盘符路径。
+      loadFs(clean.slice(0, i + 1));
     });
     $('fsPath').addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter') {
         ev.preventDefault();
+        hideFsHistory();
         navigateFs($('fsPath').value);
       }
     });
+    // 点击输入框时下拉展示访问过的目录，便于快速跳转。
+    $('fsPath').addEventListener('focus', renderFsHistory);
+    $('fsPath').addEventListener('click', (ev) => { ev.stopPropagation(); renderFsHistory(); });
+    // 点击页面其它位置收起下拉。
+    document.addEventListener('click', hideFsHistory);
+    function renderFsHistory() {
+      const box = $('fsHistory');
+      if (!state.current || state.fsHistory.length === 0) { box.classList.add('hidden'); return; }
+      box.textContent = '';
+      state.fsHistory.forEach((p) => {
+        const li = el('li', 'fs-hist-item', p);
+        li.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          hideFsHistory();
+          navigateFs(p);
+        });
+        box.appendChild(li);
+      });
+      box.classList.remove('hidden');
+    }
+    function hideFsHistory() { $('fsHistory').classList.add('hidden'); }
     $('fsNew').addEventListener('click', newFsFile);
     $('fsUpload').addEventListener('click', () => $('fsFileInput').click());
     $('fsFileInput').addEventListener('change', (ev) => {
@@ -1198,10 +1980,22 @@
       ev.target.value = '';
     });
     $('fsSave').addEventListener('click', saveFsFile);
-    $('fsEditClose').addEventListener('click', () => $('fsEditor').classList.add('hidden'));
+    $('fsWrap').addEventListener('click', () => {
+      state.fsWrap = !state.fsWrap;
+      applyFsWrap();
+    });
+    $('fsEditClose').addEventListener('click', closeFsEditor);
+    $('fsEditorBackdrop').addEventListener('click', closeFsEditor);
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && !$('fsEditor').classList.contains('hidden')) closeFsEditor();
+    });
     $('fsContent').addEventListener('input', syncFsGutter);
     $('fsContent').addEventListener('scroll', () => {
       $('fsGutter').scrollTop = $('fsContent').scrollTop;
+    });
+    // 窗口尺寸变化会改变软换行结果，弹窗打开时重排行号。
+    window.addEventListener('resize', () => {
+      if (!$('fsEditor').classList.contains('hidden')) syncFsGutter();
     });
   }
 

@@ -16,6 +16,7 @@
     </div>
   </div>
   <div class="topbar-right">
+    <button id="btnSettings" class="btn ghost">全局设置</button>
     <button id="btnNew" class="btn primary">新建靶标</button>
   </div>
 </header>
@@ -55,7 +56,11 @@
       </div>
 
       <div class="tabs">
-        <button class="tab active" data-tab="sys">
+        <button class="tab active" data-tab="info">
+          <svg class="tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="12" x2="16" y2="8"/><line x1="12" y1="3" x2="12" y2="12"/></svg>
+          <span>信息</span>
+        </button>
+        <button class="tab" data-tab="sys">
           <svg class="tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg>
           <span>系统</span>
         </button>
@@ -70,6 +75,14 @@
         <button class="tab" data-tab="proc">
           <svg class="tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M6 8.5v7"/><path d="M18 12h-7.5a3 3 0 0 1-3 3"/></svg>
           <span>进程</span>
+        </button>
+        <button class="tab" data-tab="ports">
+          <svg class="tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="9" width="20" height="6" rx="1"/><path d="M6 9V7a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v2"/><path d="M6 15v2a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/><circle cx="12" cy="12" r="1"/></svg>
+          <span>端口</span>
+        </button>
+        <button class="tab" data-tab="phpinfo">
+          <svg class="tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 13l2 2 4-4"/></svg>
+          <span>环境</span>
         </button>
       </div>
 
@@ -102,16 +115,21 @@
         <div class="fs-toolbar">
           <button id="fsUp" class="btn ghost">↑ 上级</button>
           <span class="fs-path-label">当前目录</span>
-          <input id="fsPath" class="fs-path" type="text" spellcheck="false" autocomplete="off" placeholder="输入目录路径，回车切换">
+          <span class="fs-path-wrap">
+            <input id="fsPath" class="fs-path" type="text" spellcheck="false" autocomplete="off" placeholder="输入目录路径，回车切换">
+            <ul id="fsHistory" class="fs-history hidden"></ul>
+          </span>
           <span class="spacer"></span>
           <button id="fsNew" class="btn ghost">新建文件</button>
           <button id="fsUpload" class="btn primary">上传</button>
         </div>
         <ul id="fsList" class="fs-list"></ul>
-        <div id="fsEditor" class="fs-editor hidden">
+        <div id="fsEditorBackdrop" class="fs-editor-backdrop hidden"></div>
+        <div id="fsEditor" class="fs-editor hidden" role="dialog" aria-modal="true">
           <div class="fs-editor-head">
             <span id="fsEditName" class="fs-edit-name"></span>
             <span class="spacer"></span>
+            <button id="fsWrap" class="btn ghost" title="开启后按宽度自动换行，行号按显示行排版">自动换行</button>
             <button id="fsSave" class="btn primary">保存</button>
             <button id="fsEditClose" class="btn ghost">关闭</button>
           </div>
@@ -121,6 +139,15 @@
           </div>
         </div>
         <input id="fsFileInput" type="file" class="hidden">
+      </div>
+
+      <div id="infoPanel" class="info-panel hidden">
+        <div class="info-toolbar">
+          <button id="infoRefresh" class="btn primary">刷新</button>
+          <span class="spacer"></span>
+          <span id="infoUpdated" class="sys-updated"></span>
+        </div>
+        <div id="infoBody" class="info-body"></div>
       </div>
 
       <div id="sysPanel" class="sys-panel hidden">
@@ -149,6 +176,42 @@
           <span id="procUpdated" class="sys-updated"></span>
         </div>
         <div id="procBody" class="proc-body"></div>
+      </div>
+
+      <div id="portsPanel" class="ports-panel hidden">
+        <div class="ports-scan">
+          <div class="ports-scan-row">
+            <label class="ports-scan-field">目标主机
+              <input id="scanHost" class="scan-input" type="text" spellcheck="false" placeholder="IP/域名，或网段 192.168.1.1-254 / 192.168.1.0/24">
+            </label>
+            <label class="ports-scan-field">端口
+              <input id="scanPorts" class="scan-input" type="text" spellcheck="false" value="21,22,23,25,53,80,110,135,139,143,443,445,1433,1521,3306,3389,5432,6379,8080,8000,8443,9000,9200,11211,27017" placeholder="80 或 1-1000 或 21,22,80,443">
+            </label>
+            <button id="scanBtn" class="btn primary">扫描</button>
+          </div>
+          <div id="scanStatus" class="scan-status"></div>
+          <div class="fs-hint">支持单个 IP、区间（192.168.1.1-254）、CIDR（192.168.1.0/24）与逗号列表；多主机时先探测常见端口存活，再扫描开放端口。</div>
+          <div id="scanBody" class="ports-body"></div>
+        </div>
+        <div class="ports-divider"></div>
+        <div class="ports-toolbar">
+          <button id="portsRefresh" class="btn primary">刷新</button>
+          <label class="ports-auto"><input type="checkbox" id="portsAuto"> 自动刷新（3s）</label>
+          <span class="spacer"></span>
+          <input id="portsSearch" class="ports-search" type="text" spellcheck="false" placeholder="过滤：地址 / 端口 / 进程 / PID">
+          <span id="portsUpdated" class="sys-updated"></span>
+        </div>
+        <div id="portsBody" class="ports-body"></div>
+      </div>
+
+      <div id="phpinfoPanel" class="phpinfo-panel hidden">
+        <div class="phpinfo-toolbar">
+          <button id="phpinfoRefresh" class="btn primary">刷新</button>
+          <label class="phpinfo-auto"><input type="checkbox" id="phpinfoAuto"> 自动刷新（3s）</label>
+          <span class="spacer"></span>
+          <span id="phpinfoUpdated" class="sys-updated"></span>
+        </div>
+        <div id="phpinfoBody" class="phpinfo-body"></div>
       </div>
     </div>
   </section>
@@ -183,11 +246,37 @@
       <label>备注
         <input name="note" placeholder="题目来源、解题思路等">
       </label>
+      <label>HTTP 代理
+        <input name="proxy" placeholder="可选，如 http://127.0.0.1:8080 或 socks5://host:1080">
+      </label>
       <div class="modal-actions">
         <button type="button" class="btn ghost" data-close>取消</button>
         <button type="submit" class="btn primary">保存</button>
       </div>
     </form>
+  </div>
+</div>
+
+<!-- 全局设置 -->
+<div id="modalSettings" class="modal hidden">
+  <div class="modal-box">
+    <h3>全局设置</h3>
+    <p class="note">该设置对所有靶标生效，保存后立即作用于后续请求。</p>
+    <label>User-Agent 模式
+      <select id="uaMode">
+        <option value="default">默认（weshell/ctf-teaching）</option>
+        <option value="specified">固定 UA</option>
+        <option value="random">随机（每次请求随机浏览器 UA）</option>
+      </select>
+    </label>
+    <label id="uaValueWrap" hidden>
+      <span>指定 UA</span>
+      <textarea id="uaValue" rows="3" placeholder="如 Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."></textarea>
+    </label>
+    <div class="modal-actions">
+      <button type="button" class="btn ghost" data-close>取消</button>
+      <button id="saveSettings" type="button" class="btn primary">保存</button>
+    </div>
   </div>
 </div>
 

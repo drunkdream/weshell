@@ -25,12 +25,17 @@ type Target struct {
 	Param      string    `json:"param"`
 	Method     string    `json:"method"`
 	Proxy      string    `json:"proxy,omitempty"` // 可选，访问该靶机的 HTTP 代理
+	Encoding   string    `json:"encoding,omitempty"` // 载荷编码方式：空/none(原样)、base64、hex、xor
+	EncodingKey string   `json:"encodingKey,omitempty"` // xor 编码密钥（仅 xor 方式需要）
 	CreatedAt  time.Time `json:"createdAt"`
 	LastUsedAt time.Time `json:"lastUsedAt,omitempty"`
 	Note       string    `json:"note"`
 	// Verified 表示是否已通过「测试连接」验证 shell 可达且能正常回显。
 	// 保存靶标时不强制探测，因此新增与改 URL 后默认为 false，需用户主动测试。
 	Verified bool `json:"verified,omitempty"`
+	// Os 是持久化的操作系统类型（'windows'/'linux'/'mac'），由 /verify 实测后写入；
+	// 空串表示尚未探测，前端按引擎类型（ASP→Windows、PHP→Linux）猜测显示。
+	Os string `json:"os,omitempty"`
 }
 
 // GlobalSettings 是服务级全局设置，对所有靶标生效。
@@ -206,7 +211,7 @@ func (s *Store) AppendRecord(r CommandRecord) {
 	}
 	// 审计记录落盘失败不应中断正在进行的命令执行，仅提示。
 	if err := s.saveLocked(); err != nil {
-		fmt.Fprintf(os.Stderr, "[weshell] 审计记录落盘失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "审计记录落盘失败: %v\n", err)
 	}
 }
 

